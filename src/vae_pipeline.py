@@ -1,3 +1,4 @@
+import argparse
 import os, warnings
 import numpy as np
 import time
@@ -24,7 +25,21 @@ from vae.vae_utils import (
 from visualize import plot_samples, plot_latent_space_samples, visualize_and_save_tsne
 
 
-def run_vae_pipeline(dataset_name: str, vae_type: str):
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the TimeVAE training pipeline.")
+    parser.add_argument(
+        "--valid-perc",
+        type=float,
+        default=0.1,
+        help="Fraction of samples to reserve for validation. Default: 0.1.",
+    )
+    return parser.parse_args()
+
+
+def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1):
+    if not 0 < valid_perc < 1:
+        raise ValueError("valid_perc must be between 0 and 1.")
+
     # ----------------------------------------------------------------------------------
     # Load data, perform train/valid split, scale data
 
@@ -32,7 +47,7 @@ def run_vae_pipeline(dataset_name: str, vae_type: str):
     data = load_data(data_dir=paths.DATASETS_DIR, dataset=dataset_name)
 
     # split data into train/valid splits
-    train_data, valid_data = split_data(data, valid_perc=0.1, shuffle=True)
+    train_data, valid_data = split_data(data, valid_perc=valid_perc, shuffle=True)
 
     # scale data
     scaled_train_data, scaled_valid_data, scaler = scale_data(train_data, valid_data)
@@ -131,10 +146,12 @@ def run_vae_pipeline(dataset_name: str, vae_type: str):
 
 
 if __name__ == "__main__":
+    args = parse_args()
+
     # check `/data/` for available datasets
     dataset = "sine_subsampled_train_perc_20"
 
     # models: vae_dense, vae_conv, timeVAE
     model_name = "timeVAE"
 
-    run_vae_pipeline(dataset, model_name)
+    run_vae_pipeline(dataset, model_name, valid_perc=args.valid_perc)
