@@ -6,6 +6,8 @@ timeVAE:
     - 200
   reconstruction_wt: 3.0
   batch_size: 16
+  kl_anneal_epochs: 50
+  free_bits: 0.1
   use_residual_conn: true
   trend_poly: 0
   custom_seas: null
@@ -21,6 +23,8 @@ vae_dense:
     - 200
   reconstruction_wt: 3.0
   batch_size: 16
+  kl_anneal_epochs: 50
+  free_bits: 0.1
 
 vae_conv:
   latent_dim: 8
@@ -30,3 +34,5 @@ vae_conv:
     - 200
   reconstruction_wt: 3.0
   batch_size: 16
+  kl_anneal_epochs: 50
+  free_bits: 0.1

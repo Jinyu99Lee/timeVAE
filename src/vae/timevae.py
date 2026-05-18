@@ -280,6 +280,8 @@ class TimeVAE(BaseVariationalAutoencoder):
             "feat_dim": self.feat_dim,
             "latent_dim": self.latent_dim,
             "reconstruction_wt": self.reconstruction_wt,
+            "kl_anneal_epochs": self.kl_anneal_epochs,
+            "free_bits": self.free_bits,
             "hidden_layer_sizes": list(
                 self.hidden_layer_sizes
             ),  # make sure it's a list which is serializable

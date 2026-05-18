@@ -11,7 +11,7 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Layer
 from tensorflow.keras.metrics import Mean
 from tensorflow.keras.backend import random_normal
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.callbacks import Callback, EarlyStopping, ReduceLROnPlateau
 
 
 class Sampling(Layer):
@@ -25,6 +25,16 @@ class Sampling(Layer):
         return z_mean + tf.exp(0.5 * z_log_var) * epsilon
 
 
+class KLAnnealingCallback(Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        kl_anneal_epochs = self.model.kl_anneal_epochs
+        if kl_anneal_epochs > 0:
+            kl_weight = min(1.0, epoch / kl_anneal_epochs)
+        else:
+            kl_weight = 1.0
+        self.model.kl_weight.assign(kl_weight)
+
+
 class BaseVariationalAutoencoder(Model, ABC):
     model_name = None
 
@@ -35,6 +45,8 @@ class BaseVariationalAutoencoder(Model, ABC):
         latent_dim,
         reconstruction_wt=3.0,
         batch_size=16,
+        kl_anneal_epochs=50,
+        free_bits=0.1,
         **kwargs,
     ):
         super(BaseVariationalAutoencoder, self).__init__(**kwargs)
@@ -43,6 +55,9 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.latent_dim = latent_dim
         self.reconstruction_wt = reconstruction_wt
         self.batch_size = batch_size
+        self.kl_anneal_epochs = kl_anneal_epochs
+        self.free_bits = free_bits
+        self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = Mean(name="total_loss")
         self.reconstruction_loss_tracker = Mean(name="reconstruction_loss")
         self.kl_loss_tracker = Mean(name="kl_loss")
@@ -61,9 +76,17 @@ class BaseVariationalAutoencoder(Model, ABC):
             train_data,
             epochs=max_epochs,
             batch_size=self.batch_size,
-            callbacks=[early_stopping, reduce_lr],
+            callbacks=[KLAnnealingCallback(), early_stopping, reduce_lr],
             verbose=verbose,
         )
+
+    @property
+    def metrics(self):
+        return [
+            self.total_loss_tracker,
+            self.reconstruction_loss_tracker,
+            self.kl_loss_tracker,
+        ]
 
     def call(self, X):
         z_mean, _, _ = self.encoder(X)
@@ -104,20 +127,17 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.decoder.summary()
 
     def _get_reconstruction_loss(self, X, X_recons):
-        def get_reconst_loss_by_axis(X, X_c, axis):
-            x_r = tf.reduce_mean(X, axis=axis)
-            x_c_r = tf.reduce_mean(X_recons, axis=axis)
-            err = tf.math.squared_difference(x_r, x_c_r)
-            loss = tf.reduce_sum(err)
-            return loss
-
-        # overall
         err = tf.math.squared_difference(X, X_recons)
-        reconst_loss = tf.reduce_sum(err)
+        return tf.reduce_mean(err)
 
-        reconst_loss += get_reconst_loss_by_axis(X, X_recons, axis=[2])  # by time axis
-        # reconst_loss += get_reconst_loss_by_axis(X, X_recons, axis=[1])    # by feature axis
-        return reconst_loss
+    def _get_kl_loss(self, z_mean, z_log_var):
+        kl_per_dim = 0.5 * (
+            tf.square(z_mean) + tf.exp(z_log_var) - z_log_var - 1
+        )
+        if self.free_bits > 0.0:
+            kl_per_dim = tf.maximum(kl_per_dim, self.free_bits)
+        kl_per_sample = tf.reduce_sum(kl_per_dim, axis=1)
+        return tf.reduce_mean(kl_per_sample)
 
     def train_step(self, X):
         with tf.GradientTape() as tape:
@@ -127,11 +147,12 @@ class BaseVariationalAutoencoder(Model, ABC):
 
             reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
-            kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-            kl_loss = tf.reduce_sum(tf.reduce_sum(kl_loss, axis=1))
-            # kl_loss = kl_loss / self.latent_dim
+            kl_loss = self._get_kl_loss(z_mean, z_log_var)
 
-            total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
+            total_loss = (
+                self.reconstruction_wt * reconstruction_loss
+                + self.kl_weight * kl_loss
+            )
 
         grads = tape.gradient(total_loss, self.trainable_weights)
 
@@ -143,8 +164,10 @@ class BaseVariationalAutoencoder(Model, ABC):
 
         return {
             "loss": self.total_loss_tracker.result(),
+            "total_loss": self.total_loss_tracker.result(),
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
+            "kl_weight": self.kl_weight,
         }
 
     def test_step(self, X):
@@ -152,9 +175,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         reconstruction = self.decoder(z)
         reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
-        kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
-        kl_loss = tf.reduce_sum(tf.reduce_sum(kl_loss, axis=1))
-        # kl_loss = kl_loss / self.latent_dim
+        kl_loss = self._get_kl_loss(z_mean, z_log_var)
 
         total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
 
@@ -164,6 +185,7 @@ class BaseVariationalAutoencoder(Model, ABC):
 
         return {
             "loss": self.total_loss_tracker.result(),
+            "total_loss": self.total_loss_tracker.result(),
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
         }
@@ -199,6 +221,8 @@ class BaseVariationalAutoencoder(Model, ABC):
             "feat_dim": self.feat_dim,
             "latent_dim": self.latent_dim,
             "reconstruction_wt": self.reconstruction_wt,
+            "kl_anneal_epochs": self.kl_anneal_epochs,
+            "free_bits": self.free_bits,
             "hidden_layer_sizes": list(self.hidden_layer_sizes),
         }
         params_file = os.path.join(model_dir, f"{self.model_name}_parameters.pkl")
