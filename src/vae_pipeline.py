@@ -33,10 +33,16 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Fraction of samples to reserve for validation. Default: 0.1.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed used for model initialization and data shuffling. Default: 42.",
+    )
     return parser.parse_args()
 
 
-def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1):
+def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1, seed: int = 42):
     if not 0 < valid_perc < 1:
         raise ValueError("valid_perc must be between 0 and 1.")
 
@@ -47,7 +53,7 @@ def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1):
     data = load_data(data_dir=paths.DATASETS_DIR, dataset=dataset_name)
 
     # split data into train/valid splits
-    train_data, valid_data = split_data(data, valid_perc=valid_perc, shuffle=True)
+    train_data, valid_data = split_data(data, valid_perc=valid_perc, shuffle=True, seed=seed)
 
     # scale data
     scaled_train_data, scaled_valid_data, scaler = scale_data(train_data, valid_data)
@@ -64,6 +70,7 @@ def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1):
         vae_type=vae_type,
         sequence_length=sequence_length,
         feature_dim=feature_dim,
+        seed=seed,
         **hyperparameters,
     )
 
@@ -71,6 +78,7 @@ def run_vae_pipeline(dataset_name: str, vae_type: str, valid_perc: float = 0.1):
     train_vae(
         vae=vae_model,
         train_data=scaled_train_data,
+        valid_data=scaled_valid_data,
         max_epochs=1000,
         verbose=1,
     )
@@ -154,4 +162,4 @@ if __name__ == "__main__":
     # models: vae_dense, vae_conv, timeVAE
     model_name = "timeVAE"
 
-    run_vae_pipeline(dataset, model_name, valid_perc=args.valid_perc)
+    run_vae_pipeline(dataset, model_name, valid_perc=args.valid_perc, seed=args.seed)

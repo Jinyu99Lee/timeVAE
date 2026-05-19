@@ -1,5 +1,4 @@
 from typing import Union, List, Optional
-from tensorflow.keras.optimizers import Adam
 import numpy as np
 import random
 import os
@@ -33,7 +32,12 @@ def set_seeds(seed: int = 111) -> None:
 
 
 def instantiate_vae_model(
-    vae_type: str, sequence_length: int, feature_dim: int, batch_size: int, **kwargs
+    vae_type: str,
+    sequence_length: int,
+    feature_dim: int,
+    batch_size: int,
+    seed: int = 42,
+    **kwargs,
 ) -> Union[VAE_Dense, VAE_Conv, TimeVAE]:
     """
     Instantiate a Variational Autoencoder (VAE) model based on the specified type.
@@ -51,7 +55,7 @@ def instantiate_vae_model(
     Raises:
         ValueError: If an unrecognized VAE type is provided.
     """
-    set_seeds(seed=123)
+    set_seeds(seed=seed)
 
     if vae_type == "vae_dense":
         vae = VAE_Dense(
@@ -83,7 +87,14 @@ def instantiate_vae_model(
     return vae
 
 
-def train_vae(vae, train_data, max_epochs, verbose=0):
+def train_vae(
+    vae,
+    train_data,
+    max_epochs,
+    verbose=0,
+    valid_data=None,
+    early_stopping_start_epoch=0,
+):
     """
     Train a VAE model.
 
@@ -96,7 +107,13 @@ def train_vae(vae, train_data, max_epochs, verbose=0):
                                     Defaults to 100.
         verbose (int, optional): Verbose arg for keras model.fit()
     """
-    vae.fit_on_data(train_data, max_epochs, verbose)
+    return vae.fit_on_data(
+        train_data=train_data,
+        valid_data=valid_data,
+        max_epochs=max_epochs,
+        verbose=verbose,
+        early_stopping_start_epoch=early_stopping_start_epoch,
+    )
 
 
 def save_vae_model(vae, dir_path: str) -> None:

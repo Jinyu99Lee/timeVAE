@@ -143,7 +143,7 @@ class TimeVAE(BaseVariationalAutoencoder):
         self.use_residual_conn = use_residual_conn
         self.encoder = self._get_encoder()
         self.decoder = self._get_decoder()
-        self.compile(optimizer=Adam())
+        self.compile(optimizer=Adam(learning_rate=self.learning_rate))
 
     def _get_encoder(self):
         encoder_inputs = Input(
@@ -280,6 +280,7 @@ class TimeVAE(BaseVariationalAutoencoder):
             "feat_dim": self.feat_dim,
             "latent_dim": self.latent_dim,
             "reconstruction_wt": self.reconstruction_wt,
+            "learning_rate": self.learning_rate,
             "kl_anneal_epochs": self.kl_anneal_epochs,
             "free_bits": self.free_bits,
             "hidden_layer_sizes": list(
@@ -298,5 +299,5 @@ class TimeVAE(BaseVariationalAutoencoder):
         dict_params = joblib.load(params_file)
         vae_model = TimeVAE(**dict_params)
         vae_model.load_weights(model_dir)
-        vae_model.compile(optimizer=Adam())
+        vae_model.compile(optimizer=Adam(learning_rate=vae_model.learning_rate))
         return vae_model

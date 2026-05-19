@@ -35,6 +35,56 @@ class KLAnnealingCallback(Callback):
         self.model.kl_weight.assign(kl_weight)
 
 
+class RestoreBestWeights(Callback):
+    def __init__(
+        self, monitor="val_total_loss", min_delta=0.0, mode="min", start_epoch=0
+    ):
+        super().__init__()
+        self.monitor = monitor
+        self.min_delta = min_delta
+        self.start_epoch = start_epoch
+        self.monitor_op = np.less if mode == "min" else np.greater
+        self.best = np.inf if mode == "min" else -np.inf
+        self.best_epoch = None
+        self.best_weights = None
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch < self.start_epoch:
+            return
+        logs = logs or {}
+        current = logs.get(self.monitor)
+        if current is None:
+            return
+        current = float(current)
+        improved = (
+            current + self.min_delta < self.best
+            if self.monitor_op == np.less
+            else current - self.min_delta > self.best
+        )
+        if improved:
+            self.best = current
+            self.best_epoch = epoch
+            self.best_weights = self.model.get_weights()
+
+    def on_train_end(self, logs=None):
+        if self.best_weights is not None:
+            self.model.set_weights(self.best_weights)
+        self.model.best_monitor = self.monitor
+        self.model.best_monitor_value = self.best
+        self.model.best_epoch = self.best_epoch
+
+
+class DelayedEarlyStopping(EarlyStopping):
+    def __init__(self, start_epoch=0, **kwargs):
+        super().__init__(**kwargs)
+        self.start_epoch = start_epoch
+
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch < self.start_epoch:
+            return
+        super().on_epoch_end(epoch, logs)
+
+
 class BaseVariationalAutoencoder(Model, ABC):
     model_name = None
 
@@ -45,6 +95,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         latent_dim,
         reconstruction_wt=3.0,
         batch_size=16,
+        learning_rate=0.001,
         kl_anneal_epochs=50,
         free_bits=0.1,
         **kwargs,
@@ -55,6 +106,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.latent_dim = latent_dim
         self.reconstruction_wt = reconstruction_wt
         self.batch_size = batch_size
+        self.learning_rate = learning_rate
         self.kl_anneal_epochs = kl_anneal_epochs
         self.free_bits = free_bits
         self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
@@ -64,19 +116,39 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.encoder = None
         self.decoder = None
 
-    def fit_on_data(self, train_data, max_epochs=1000, verbose=0):
-        loss_to_monitor = "total_loss"
-        early_stopping = EarlyStopping(
-            monitor=loss_to_monitor, min_delta=1e-2, patience=50, mode="min"
+    def fit_on_data(
+        self,
+        train_data,
+        valid_data=None,
+        max_epochs=1000,
+        verbose=0,
+        early_stopping_patience=50,
+        early_stopping_min_delta=1e-4,
+        early_stopping_start_epoch=0,
+    ):
+        loss_to_monitor = "val_total_loss" if valid_data is not None else "total_loss"
+        best_weights = RestoreBestWeights(
+            monitor=loss_to_monitor,
+            min_delta=early_stopping_min_delta,
+            mode="min",
+            start_epoch=early_stopping_start_epoch,
+        )
+        early_stopping = DelayedEarlyStopping(
+            start_epoch=early_stopping_start_epoch,
+            monitor=loss_to_monitor,
+            min_delta=early_stopping_min_delta,
+            patience=early_stopping_patience,
+            mode="min",
         )
         reduce_lr = ReduceLROnPlateau(
             monitor=loss_to_monitor, factor=0.5, patience=30, mode="min"
         )
-        self.fit(
+        return self.fit(
             train_data,
+            validation_data=valid_data,
             epochs=max_epochs,
             batch_size=self.batch_size,
-            callbacks=[KLAnnealingCallback(), early_stopping, reduce_lr],
+            callbacks=[KLAnnealingCallback(), best_weights, early_stopping, reduce_lr],
             verbose=verbose,
         )
 
@@ -130,11 +202,11 @@ class BaseVariationalAutoencoder(Model, ABC):
         err = tf.math.squared_difference(X, X_recons)
         return tf.reduce_mean(err)
 
-    def _get_kl_loss(self, z_mean, z_log_var):
+    def _get_kl_loss(self, z_mean, z_log_var, apply_free_bits=True):
         kl_per_dim = 0.5 * (
             tf.square(z_mean) + tf.exp(z_log_var) - z_log_var - 1
         )
-        if self.free_bits > 0.0:
+        if apply_free_bits and self.free_bits > 0.0:
             kl_per_dim = tf.maximum(kl_per_dim, self.free_bits)
         kl_per_sample = tf.reduce_sum(kl_per_dim, axis=1)
         return tf.reduce_mean(kl_per_sample)
@@ -175,9 +247,9 @@ class BaseVariationalAutoencoder(Model, ABC):
         reconstruction = self.decoder(z)
         reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
-        kl_loss = self._get_kl_loss(z_mean, z_log_var)
+        kl_loss = self._get_kl_loss(z_mean, z_log_var, apply_free_bits=False)
 
-        total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
+        total_loss = reconstruction_loss + kl_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.reconstruction_loss_tracker.update_state(reconstruction_loss)
@@ -221,6 +293,7 @@ class BaseVariationalAutoencoder(Model, ABC):
             "feat_dim": self.feat_dim,
             "latent_dim": self.latent_dim,
             "reconstruction_wt": self.reconstruction_wt,
+            "learning_rate": self.learning_rate,
             "kl_anneal_epochs": self.kl_anneal_epochs,
             "free_bits": self.free_bits,
             "hidden_layer_sizes": list(self.hidden_layer_sizes),

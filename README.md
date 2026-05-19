@@ -188,3 +188,123 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 For any inquiries or collaborations, please contact the lead author at: `<lead_author_first_name>.<lead_author_last_name>@gmail.com`.
 
 See the paper for author details.
+
+
+## Hyperparameter Grid Search
+
+For reproducible hyperparameter optimization, use the local grid-search runner instead
+of editing `src/vae_pipeline.py` for every run. Dataset names are paths relative to
+`./data/` without the `.npz` suffix. For example:
+
+```bash
+python src/hpo_grid_search.py \
+  --dataset new_npz_data/weather_data/T84/weather_london_2003_2015 \
+  --vae-type timeVAE \
+  --valid-perc 0.1 \
+  --latent-dim 4 8 16 \
+  --reconstruction-wt 1.0 3.0 5.0 \
+  --learning-rate 0.001 0.0005 \
+  --batch-size 16 32 \
+  --max-epochs 1000 \
+  --seed 42 \
+  --gpu-slots 0:2,1:2,2:4
+```
+
+You can also run all `.npz` files matched by a glob:
+
+```bash
+python src/hpo_grid_search.py \
+  --dataset-glob "data/new_npz_data/weather_data/T84/*.npz" \
+  --vae-type timeVAE \
+  --latent-dim 8 \
+  --reconstruction-wt 3.0 \
+  --learning-rate 0.001 \
+  --batch-size 16 \
+  --gpu-slots 0:1
+```
+
+Each HPO run writes its own directory under `outputs/hpo/<timestamp>/runs/` with:
+
+- `config.json`: dataset, seed, and hyperparameters for the run.
+- `history.csv`: epoch metrics including `total_loss` and `val_total_loss`.
+- `timing.json`: start time, end time, and duration in seconds.
+- `loss_curve.png`: train and validation total loss curves.
+- `best_model/`: scaler and the best validation-loss model weights.
+
+The sweep root also contains `results.csv`, `results.jsonl`, `search_config.json`, and
+`best_run.json`. The best run is selected by minimum `best_val_total_loss`.
+
+Optional Weights & Biases logging is available but disabled by default:
+
+```bash
+python src/hpo_grid_search.py ... --log-backend wandb --wandb-project timevae-hpo
+```
+
+Generated samples are not produced during HPO by default. Add `--generate-after-train`
+when you intentionally want each run to save prior samples, or generate samples later
+from the selected `best_model/`.
+
+
+## Generate From Best HPO Run
+
+After a grid search finishes, use the selected best run to generate prior samples and
+a t-SNE comparison plot without retraining:
+
+```bash
+python src/rerun_best_hpo.py \
+  --best-run outputs/hpo/<timestamp>/best_run.json \
+  --num-samples train \
+  --compare-split train \
+  --max-tsne-samples 2000
+```
+
+Input notes:
+
+- `--best-run`: path to the HPO sweep-level `best_run.json`.
+- `--num-samples`: generated prior sample count. Use `train`, `valid`, `all`, or an integer.
+- `--compare-split`: original split for t-SNE comparison: `train`, `valid`, or `all`.
+- `--max-tsne-samples`: maximum samples per side used in t-SNE.
+- `--output-dir`: optional override for output location.
+- `--save-scaled`: additionally save generated samples before inverse scaling.
+- `--no-tsne`: skip t-SNE generation.
+
+By default, outputs are written to the selected run directory:
+
+```plaintext
+outputs/hpo/<timestamp>/runs/<best_run_id>/best_outputs/
+├── <vae_type>_<dataset_name>_best_prior_samples.npz
+├── tsne_generated_vs_<compare_split>.png
+└── rerun_config.json
+```
+
+Prior sampling draws latent vectors from `N(0, I)` and decodes them; it does not use
+input samples except to choose default sizes, load the scaler, and build the t-SNE
+comparison set.
+
+
+## Plot Generated vs Original NPZ Samples
+
+Use `src/plot_npz_samples.py` to create random synthetic/original sample comparison PDFs.
+Each PDF has two columns: synthetic on the left and original on the right. Each column
+has one row per feature dimension.
+
+```bash
+python src/plot_npz_samples.py \
+  --synthetic-npz outputs/rerunbest/weather20032015/capetown_2003_2015/timeVAE_weather_capetown_2003_2015_best_prior_samples.npz \
+  --original-npz data/new_npz_data/weather_data/T84/weather_capetown_2003_2015.npz \
+  --num-pdfs 10
+```
+
+Feature names are read from `feature_cols` in the original NPZ when available. You can
+also provide names from a CSV header or manually:
+
+```bash
+python src/plot_npz_samples.py ... \
+  --original-csv data/raw_data/weather_data/weatherbench/weather_capetown.csv
+
+python src/plot_npz_samples.py ... \
+  --feature-names z500 t850 t2m u10 v10
+```
+
+Outputs are written next to the synthetic NPZ under `plots/` by default, with a
+`manifest.csv` recording which synthetic and original sample indices were drawn.
