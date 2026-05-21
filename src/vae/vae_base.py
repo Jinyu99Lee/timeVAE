@@ -98,9 +98,12 @@ class BaseVariationalAutoencoder(Model, ABC):
         learning_rate=0.001,
         kl_anneal_epochs=50,
         free_bits=0.1,
+        loss_mode="current",
         **kwargs,
     ):
         super(BaseVariationalAutoencoder, self).__init__(**kwargs)
+        if loss_mode not in ("current", "legacy"):
+            raise ValueError("loss_mode must be one of: current, legacy.")
         self.seq_len = seq_len
         self.feat_dim = feat_dim
         self.latent_dim = latent_dim
@@ -109,6 +112,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.learning_rate = learning_rate
         self.kl_anneal_epochs = kl_anneal_epochs
         self.free_bits = free_bits
+        self.loss_mode = loss_mode
         self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = Mean(name="total_loss")
         self.reconstruction_loss_tracker = Mean(name="reconstruction_loss")
@@ -198,11 +202,28 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.encoder.summary()
         self.decoder.summary()
 
-    def _get_reconstruction_loss(self, X, X_recons):
+    def _get_current_reconstruction_loss(self, X, X_recons):
         err = tf.math.squared_difference(X, X_recons)
         return tf.reduce_mean(err)
 
-    def _get_kl_loss(self, z_mean, z_log_var, apply_free_bits=True):
+    def _get_legacy_reconstruction_loss(self, X, X_recons):
+        def get_reconst_loss_by_axis(axis):
+            x_r = tf.reduce_mean(X, axis=axis)
+            x_c_r = tf.reduce_mean(X_recons, axis=axis)
+            err = tf.math.squared_difference(x_r, x_c_r)
+            return tf.reduce_sum(err)
+
+        err = tf.math.squared_difference(X, X_recons)
+        reconst_loss = tf.reduce_sum(err)
+        reconst_loss += get_reconst_loss_by_axis(axis=[2])
+        return reconst_loss
+
+    def _get_reconstruction_loss(self, X, X_recons):
+        if self.loss_mode == "legacy":
+            return self._get_legacy_reconstruction_loss(X, X_recons)
+        return self._get_current_reconstruction_loss(X, X_recons)
+
+    def _get_current_kl_loss(self, z_mean, z_log_var, apply_free_bits=True):
         kl_per_dim = 0.5 * (
             tf.square(z_mean) + tf.exp(z_log_var) - z_log_var - 1
         )
@@ -210,6 +231,17 @@ class BaseVariationalAutoencoder(Model, ABC):
             kl_per_dim = tf.maximum(kl_per_dim, self.free_bits)
         kl_per_sample = tf.reduce_sum(kl_per_dim, axis=1)
         return tf.reduce_mean(kl_per_sample)
+
+    def _get_legacy_kl_loss(self, z_mean, z_log_var):
+        kl_loss = -0.5 * (1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var))
+        return tf.reduce_sum(tf.reduce_sum(kl_loss, axis=1))
+
+    def _get_kl_loss(self, z_mean, z_log_var, apply_free_bits=True):
+        if self.loss_mode == "legacy":
+            return self._get_legacy_kl_loss(z_mean, z_log_var)
+        return self._get_current_kl_loss(
+            z_mean, z_log_var, apply_free_bits=apply_free_bits
+        )
 
     def train_step(self, X):
         with tf.GradientTape() as tape:
@@ -221,10 +253,13 @@ class BaseVariationalAutoencoder(Model, ABC):
 
             kl_loss = self._get_kl_loss(z_mean, z_log_var)
 
-            total_loss = (
-                self.reconstruction_wt * reconstruction_loss
-                + self.kl_weight * kl_loss
-            )
+            if self.loss_mode == "legacy":
+                total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
+            else:
+                total_loss = (
+                    self.reconstruction_wt * reconstruction_loss
+                    + self.kl_weight * kl_loss
+                )
 
         grads = tape.gradient(total_loss, self.trainable_weights)
 
@@ -249,7 +284,10 @@ class BaseVariationalAutoencoder(Model, ABC):
 
         kl_loss = self._get_kl_loss(z_mean, z_log_var, apply_free_bits=False)
 
-        total_loss = reconstruction_loss + kl_loss
+        if self.loss_mode == "legacy":
+            total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
+        else:
+            total_loss = reconstruction_loss + kl_loss
 
         self.total_loss_tracker.update_state(total_loss)
         self.reconstruction_loss_tracker.update_state(reconstruction_loss)
@@ -296,6 +334,7 @@ class BaseVariationalAutoencoder(Model, ABC):
             "learning_rate": self.learning_rate,
             "kl_anneal_epochs": self.kl_anneal_epochs,
             "free_bits": self.free_bits,
+            "loss_mode": self.loss_mode,
             "hidden_layer_sizes": list(self.hidden_layer_sizes),
         }
         params_file = os.path.join(model_dir, f"{self.model_name}_parameters.pkl")

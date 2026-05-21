@@ -28,7 +28,9 @@ RESULT_FIELDS = [
     "reconstruction_wt",
     "learning_rate",
     "batch_size",
+    "loss_mode",
     "early_stopping_start_epoch",
+    "early_stopping_min_delta",
     "best_val_total_loss",
     "best_epoch",
     "duration_seconds",
@@ -49,10 +51,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, nargs="+", required=True)
     parser.add_argument("--max-epochs", type=int, default=1000)
     parser.add_argument(
+        "--loss-mode",
+        choices=("current", "legacy"),
+        default="current",
+        help="VAE loss formula passed to each child training run.",
+    )
+    parser.add_argument(
         "--early-stopping-start-epoch",
         type=int,
         default=0,
         help="Pass-through to train_single_vae.py; early stopping starts counting at this zero-based epoch.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Pass-through to train_single_vae.py; minimum monitored-loss improvement required by early stopping.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-slots", required=True, help="GPU concurrency map, e.g. 0:2,1:2,2:4. Use none:1 for CPU.")
@@ -209,7 +223,9 @@ def build_jobs(args: argparse.Namespace, datasets: list[str], output_dir: Path) 
                 "reconstruction_wt": reconstruction_wt,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
+                "loss_mode": args.loss_mode,
                 "early_stopping_start_epoch": args.early_stopping_start_epoch,
+                "early_stopping_min_delta": args.early_stopping_min_delta,
             }
         )
     return jobs
@@ -244,8 +260,12 @@ def launch_job(
         str(job["batch_size"]),
         "--max-epochs",
         str(args.max_epochs),
+        "--loss-mode",
+        args.loss_mode,
         "--early-stopping-start-epoch",
         str(args.early_stopping_start_epoch),
+        "--early-stopping-min-delta",
+        str(args.early_stopping_min_delta),
         "--seed",
         str(args.seed),
         "--run-dir",
@@ -289,7 +309,9 @@ def read_result(job: dict[str, Any], gpu_id: str, return_code: int) -> dict[str,
             "reconstruction_wt": job["reconstruction_wt"],
             "learning_rate": job["learning_rate"],
             "batch_size": job["batch_size"],
+            "loss_mode": job["loss_mode"],
             "early_stopping_start_epoch": job["early_stopping_start_epoch"],
+            "early_stopping_min_delta": job["early_stopping_min_delta"],
             "run_dir": str(job["run_dir"]),
         }
     result["gpu_id"] = gpu_id
@@ -300,6 +322,8 @@ def main() -> None:
     args = parse_args()
     if args.early_stopping_start_epoch < 0:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
+    if args.early_stopping_min_delta < 0:
+        raise ValueError("--early-stopping-min-delta must be non-negative.")
     datasets = collect_datasets(args)
     gpu_slots = parse_gpu_slots(args.gpu_slots)
     output_dir = resolve_output_dir(args, datasets)
@@ -316,6 +340,7 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "loss_mode": args.loss_mode,
             "max_epochs": args.max_epochs,
             "experiment_group": args.experiment_group,
             "experiment_name": args.experiment_name or default_experiment_name(datasets),
@@ -323,6 +348,7 @@ def main() -> None:
             "allow_cpu_fallback": args.allow_cpu_fallback,
             "nvidia_library_dirs": pip_nvidia_library_dirs(),
             "early_stopping_start_epoch": args.early_stopping_start_epoch,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
             "seed": args.seed,
             "gpu_slots": args.gpu_slots,
             "num_jobs": len(jobs),

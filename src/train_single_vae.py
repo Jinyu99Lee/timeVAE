@@ -84,10 +84,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--max-epochs", type=int, default=1000)
     parser.add_argument(
+        "--loss-mode",
+        choices=("current", "legacy"),
+        default="current",
+        help="VAE loss formula: current uses KL annealing/free bits/new validation loss; legacy uses the original pre-annealing loss.",
+    )
+    parser.add_argument(
         "--early-stopping-start-epoch",
         type=int,
         default=0,
         help="Do not count early-stopping patience before this zero-based epoch.",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum monitored-loss improvement required by early stopping.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -184,6 +196,8 @@ def main() -> None:
         raise ValueError("--valid-perc must be between 0 and 1.")
     if args.early_stopping_start_epoch < 0:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
+    if args.early_stopping_min_delta < 0:
+        raise ValueError("--early-stopping-min-delta must be non-negative.")
 
     run_dir = args.run_dir
     model_dir = run_dir / "best_model"
@@ -200,6 +214,7 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "loss_mode": args.loss_mode,
         }
     )
 
@@ -212,6 +227,8 @@ def main() -> None:
         "seed": args.seed,
         "max_epochs": args.max_epochs,
         "early_stopping_start_epoch": args.early_stopping_start_epoch,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
+        "loss_mode": args.loss_mode,
         "require_gpu": args.require_gpu,
         "gpu_status": gpu_status,
         "hyperparameters": hyperparameters,
@@ -248,6 +265,7 @@ def main() -> None:
             valid_data=scaled_valid_data,
             max_epochs=args.max_epochs,
             verbose=args.verbose,
+            early_stopping_min_delta=args.early_stopping_min_delta,
             early_stopping_start_epoch=args.early_stopping_start_epoch,
         )
         history = history_obj.history
@@ -295,7 +313,9 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "loss_mode": args.loss_mode,
             "early_stopping_start_epoch": args.early_stopping_start_epoch,
+            "early_stopping_min_delta": args.early_stopping_min_delta,
             "require_gpu": args.require_gpu,
             "gpu_status": gpu_status,
             "best_val_total_loss": best_val,
