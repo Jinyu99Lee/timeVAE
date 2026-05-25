@@ -153,11 +153,18 @@ def main() -> None:
     dataset = config["dataset"]
     vae_type = config["vae_type"]
     valid_perc = float(config["valid_perc"])
+    split_method = config.get("split_method", "tail_holdout")
     seed = int(args.seed if args.seed is not None else config.get("seed", 42))
     set_seeds(seed)
 
     data = load_data(data_dir=paths.DATASETS_DIR, dataset=dataset)
-    train_data, valid_data = split_data(data, valid_perc=valid_perc, shuffle=True, seed=seed)
+    train_data, valid_data = split_data(
+        data,
+        valid_perc=valid_perc,
+        shuffle=True,
+        seed=seed,
+        split_method=split_method,
+    )
     scaler = load_scaler(str(model_dir))
     scaled_train_data = scaler.transform(train_data)
     scaled_valid_data = scaler.transform(valid_data)
@@ -197,6 +204,7 @@ def main() -> None:
         "dataset": dataset,
         "vae_type": vae_type,
         "valid_perc": valid_perc,
+        "split_method": split_method,
         "seed": seed,
         "num_samples_spec": args.num_samples,
         "num_samples": num_samples,

@@ -55,34 +55,95 @@ def get_npz_data(input_file: str) -> np.ndarray:
     return loaded["data"]
 
 
+def _full_train_recent_blocks_valid_data(data: np.ndarray) -> np.ndarray:
+    """
+    Build a validation set by copying three recent-year sample blocks.
+
+    The slices are expressed on the sample axis and intentionally match the
+    experiment protocol:
+    - last year's last 122 samples: data[-122:]
+    - second-last year's middle 122 samples: data[-365-244:-365-122]
+    - third-last year's earliest 122 samples: data[-730-366:-730-244]
+    """
+    valid_slices = (
+        slice(-122, None),
+        slice(-365 - 244, -365 - 122),
+        slice(-730 - 366, -730 - 244),
+    )
+    if data.shape[0] < 1096:
+        raise ValueError(
+            "split_method='full_train_recent_blocks' requires at least 1096 "
+            f"samples, got {data.shape[0]}."
+        )
+
+    valid_parts = [data[valid_slice].copy() for valid_slice in valid_slices]
+    expected_block_size = 122
+    for idx, valid_part in enumerate(valid_parts):
+        if valid_part.shape[0] != expected_block_size:
+            raise ValueError(
+                "Recent-block validation split produced an unexpected block size "
+                f"for block {idx}: expected {expected_block_size}, got "
+                f"{valid_part.shape[0]}."
+            )
+
+    return np.concatenate(valid_parts, axis=0)
+
+
+def _shuffle_samples(data: np.ndarray, seed: int) -> np.ndarray:
+    shuffled = data.copy()
+    np.random.seed(seed)
+    np.random.shuffle(shuffled)
+    return shuffled
+
+
 def split_data(
-    data: np.ndarray, valid_perc: float, shuffle: bool = True, seed: int = 123
+    data: np.ndarray,
+    valid_perc: float,
+    shuffle: bool = True,
+    seed: int = 123,
+    split_method: str = "tail_holdout",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Split the data into training and validation sets.
 
     Args:
         data (np.ndarray): The dataset to split.
-        valid_perc (float): The percentage of data to use for validation.
-        shuffle (bool, optional): Whether to shuffle the data before splitting.
+        valid_perc (float): The percentage of data to use for validation for
+                            split_method="tail_holdout".
+        shuffle (bool, optional): Whether to shuffle the returned training data.
+                                  Validation data is never shuffled.
                                   Defaults to True.
-        seed (int, optional): The random seed to use for shuffling the data.
+        seed (int, optional): The random seed to use for shuffling training data.
                               Defaults to 123.
+        split_method (str, optional): Split strategy. "tail_holdout" reserves
+                                      the last valid_perc samples for validation,
+                                      then shuffles only the training split.
+                                      "full_train_recent_blocks" uses all samples
+                                      for shuffled training and copies validation
+                                      from three recent-year blocks.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: A tuple containing the training data and
                                        validation data arrays.
     """
+    if split_method == "full_train_recent_blocks":
+        train_data = _shuffle_samples(data, seed) if shuffle else data.copy()
+        valid_data = _full_train_recent_blocks_valid_data(data)
+        return train_data, valid_data
+    if split_method != "tail_holdout":
+        raise ValueError(
+            f"Unknown split_method={split_method!r}. Expected 'tail_holdout' "
+            "or 'full_train_recent_blocks'."
+        )
+
     N = data.shape[0]
     N_train = int(N * (1 - valid_perc))
+    train_data = data[:N_train].copy()
+    valid_data = data[N_train:].copy()
 
     if shuffle:
-        np.random.seed(seed)
-        data = data.copy()
-        np.random.shuffle(data)
+        train_data = _shuffle_samples(train_data, seed)
 
-    train_data = data[:N_train]
-    valid_data = data[N_train:]
     return train_data, valid_data
 
 

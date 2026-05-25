@@ -78,6 +78,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, help="Dataset path relative to data/, without .npz.")
     parser.add_argument("--vae-type", default="timeVAE", choices=("timeVAE", "vae_dense", "vae_conv"))
     parser.add_argument("--valid-perc", type=float, default=0.1)
+    parser.add_argument(
+        "--split-method",
+        choices=("tail_holdout", "full_train_recent_blocks"),
+        default="tail_holdout",
+        help=(
+            "Data split strategy. tail_holdout reserves the final "
+            "valid-percentage samples for validation, then shuffles only "
+            "training data; full_train_recent_blocks uses all samples for "
+            "training and copies validation from three recent 122-sample "
+            "blocks."
+        ),
+    )
     parser.add_argument("--latent-dim", type=int, required=True)
     parser.add_argument("--reconstruction-wt", type=float, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
@@ -192,8 +204,8 @@ def main() -> None:
     args = parse_args()
     if args.run_id is None:
         args.run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    if not 0 < args.valid_perc < 1:
-        raise ValueError("--valid-perc must be between 0 and 1.")
+    if args.split_method == "tail_holdout" and not 0 < args.valid_perc < 1:
+        raise ValueError("--valid-perc must be between 0 and 1 for tail_holdout splits.")
     if args.early_stopping_start_epoch < 0:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
     if args.early_stopping_min_delta < 0:
@@ -224,6 +236,7 @@ def main() -> None:
         "dataset": args.dataset,
         "vae_type": args.vae_type,
         "valid_perc": args.valid_perc,
+        "split_method": args.split_method,
         "seed": args.seed,
         "max_epochs": args.max_epochs,
         "early_stopping_start_epoch": args.early_stopping_start_epoch,
@@ -248,7 +261,13 @@ def main() -> None:
                 f"gpu_status={gpu_status}"
             )
         data = load_data(data_dir=paths.DATASETS_DIR, dataset=args.dataset)
-        train_data, valid_data = split_data(data, valid_perc=args.valid_perc, shuffle=True, seed=args.seed)
+        train_data, valid_data = split_data(
+            data,
+            valid_perc=args.valid_perc,
+            shuffle=True,
+            seed=args.seed,
+            split_method=args.split_method,
+        )
         scaled_train_data, scaled_valid_data, scaler = scale_data(train_data, valid_data)
 
         _, sequence_length, feature_dim = scaled_train_data.shape
@@ -314,6 +333,8 @@ def main() -> None:
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
             "loss_mode": args.loss_mode,
+            "valid_perc": args.valid_perc,
+            "split_method": args.split_method,
             "early_stopping_start_epoch": args.early_stopping_start_epoch,
             "early_stopping_min_delta": args.early_stopping_min_delta,
             "require_gpu": args.require_gpu,

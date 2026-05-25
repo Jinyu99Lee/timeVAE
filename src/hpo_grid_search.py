@@ -29,6 +29,8 @@ RESULT_FIELDS = [
     "learning_rate",
     "batch_size",
     "loss_mode",
+    "valid_perc",
+    "split_method",
     "early_stopping_start_epoch",
     "early_stopping_min_delta",
     "best_val_total_loss",
@@ -45,6 +47,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-glob", default=None, help="Glob for npz files, e.g. data/new_npz_data/weather_data/T84/*.npz.")
     parser.add_argument("--vae-type", default="timeVAE", choices=("timeVAE", "vae_dense", "vae_conv"))
     parser.add_argument("--valid-perc", type=float, default=0.1)
+    parser.add_argument(
+        "--split-method",
+        choices=("tail_holdout", "full_train_recent_blocks"),
+        default="tail_holdout",
+        help=(
+            "Data split strategy passed to train_single_vae.py. "
+            "tail_holdout reserves the final valid-percentage samples for "
+            "validation, then shuffles only training data; "
+            "full_train_recent_blocks uses all samples for training and "
+            "copies validation from three recent 122-sample blocks."
+        ),
+    )
     parser.add_argument("--latent-dim", type=int, nargs="+", required=True)
     parser.add_argument("--reconstruction-wt", type=float, nargs="+", required=True)
     parser.add_argument("--learning-rate", type=float, nargs="+", required=True)
@@ -224,6 +238,8 @@ def build_jobs(args: argparse.Namespace, datasets: list[str], output_dir: Path) 
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
                 "loss_mode": args.loss_mode,
+                "valid_perc": args.valid_perc,
+                "split_method": args.split_method,
                 "early_stopping_start_epoch": args.early_stopping_start_epoch,
                 "early_stopping_min_delta": args.early_stopping_min_delta,
             }
@@ -250,6 +266,8 @@ def launch_job(
         args.vae_type,
         "--valid-perc",
         str(args.valid_perc),
+        "--split-method",
+        args.split_method,
         "--latent-dim",
         str(job["latent_dim"]),
         "--reconstruction-wt",
@@ -310,6 +328,8 @@ def read_result(job: dict[str, Any], gpu_id: str, return_code: int) -> dict[str,
             "learning_rate": job["learning_rate"],
             "batch_size": job["batch_size"],
             "loss_mode": job["loss_mode"],
+            "valid_perc": job["valid_perc"],
+            "split_method": job["split_method"],
             "early_stopping_start_epoch": job["early_stopping_start_epoch"],
             "early_stopping_min_delta": job["early_stopping_min_delta"],
             "run_dir": str(job["run_dir"]),
@@ -336,6 +356,7 @@ def main() -> None:
             "datasets": datasets,
             "vae_type": args.vae_type,
             "valid_perc": args.valid_perc,
+            "split_method": args.split_method,
             "latent_dim": args.latent_dim,
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
