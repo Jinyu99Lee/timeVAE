@@ -14,6 +14,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import LogFormatterMathtext, LogLocator
 import numpy as np
 
 import paths
@@ -32,6 +33,16 @@ from vae.vae_utils import (
     save_vae_model,
     train_vae,
 )
+
+
+MONITOR_METRIC_CHOICES = (
+    "total_loss",
+    "val_total_loss",
+    "histogram_distance",
+    "val_histogram_distance",
+)
+
+HISTOGRAM_DISTANCE_BACKEND_CHOICES = ("numpy", "tensorflow")
 
 
 class WandbEpochLogger:
@@ -86,15 +97,44 @@ def parse_args() -> argparse.Namespace:
             "Data split strategy. tail_holdout reserves the final "
             "valid-percentage samples for validation, then shuffles only "
             "training data; full_train_recent_blocks uses all samples for "
-            "training and copies validation from three recent 122-sample "
-            "blocks."
+            "training and copies validation from three recent "
+            "122-day/488-sample blocks."
         ),
     )
     parser.add_argument("--latent-dim", type=int, required=True)
     parser.add_argument("--reconstruction-wt", type=float, required=True)
     parser.add_argument("--learning-rate", type=float, required=True)
     parser.add_argument("--batch-size", type=int, required=True)
+    parser.add_argument(
+        "--free-bits",
+        type=float,
+        default=None,
+        help="Override the VAE free-bits value from hyperparameters.yaml.",
+    )
+    parser.add_argument(
+        "--kl-anneal-epochs",
+        type=int,
+        default=None,
+        help="Override the VAE KL annealing epochs from hyperparameters.yaml.",
+    )
     parser.add_argument("--max-epochs", type=int, default=1000)
+    parser.add_argument(
+        "--histogram-distance-backend",
+        choices=HISTOGRAM_DISTANCE_BACKEND_CHOICES,
+        default="numpy",
+        help=(
+            "Backend for batch histogram_distance monitoring. numpy matches "
+            "rerun semantics most closely; tensorflow avoids per-batch NumPy callbacks."
+        ),
+    )
+    parser.add_argument(
+        "--disable-train-histogram-distance",
+        action="store_true",
+        help=(
+            "Skip histogram_distance during training batches. Validation histogram "
+            "distance is still computed for val_histogram_distance."
+        ),
+    )
     parser.add_argument(
         "--loss-mode",
         choices=("current", "legacy"),
@@ -112,6 +152,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-4,
         help="Minimum monitored-loss improvement required by early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=50,
+        help="Number of unimproved monitored epochs to tolerate before early stopping.",
+    )
+    parser.add_argument(
+        "--monitor-metric",
+        choices=MONITOR_METRIC_CHOICES,
+        default=None,
+        help=(
+            "Metric used for best-weight restore and early stopping, and for "
+            "LR reduction when --enable-reduce-lr-on-plateau is set. "
+            "Defaults to val_total_loss when validation data is provided."
+        ),
+    )
+    parser.add_argument(
+        "--enable-reduce-lr-on-plateau",
+        action="store_true",
+        help=(
+            "Enable Keras ReduceLROnPlateau. Disabled by default. "
+            "When enabled, it monitors --monitor-metric with factor=0.5 and patience=30."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run-dir", type=Path, required=True)
@@ -158,27 +222,95 @@ def write_history_csv(path: Path, history: dict[str, list[Any]]) -> None:
 
 
 def plot_loss_curve(path: Path, history: dict[str, list[Any]]) -> None:
-    plt.figure(figsize=(8, 5))
-    if "total_loss" in history:
-        plt.plot(history["total_loss"], label="train_total_loss")
-    elif "loss" in history:
-        plt.plot(history["loss"], label="train_loss")
-    if "val_total_loss" in history:
-        plt.plot(history["val_total_loss"], label="val_total_loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(path)
-    plt.close()
+    def plot_values(ax, values, label: str, color: str, linestyle: str) -> bool:
+        if values is None:
+            return False
+        series = np.asarray(values, dtype=float)
+        epochs = np.arange(series.shape[0])
+        positive = np.isfinite(series) & (series > 0.0)
+        if not np.any(positive):
+            return False
+        ax.plot(
+            epochs[positive],
+            series[positive],
+            label=label,
+            color=color,
+            linestyle=linestyle,
+            linewidth=2.4,
+        )
+        return True
+
+    def plot_series(ax, key: str, label: str, color: str, linestyle: str) -> bool:
+        values = history.get(key, [])
+        if not values:
+            return False
+        return plot_values(ax, values, label, color, linestyle)
+
+    def plot_sum_series(
+        ax, key_a: str, key_b: str, label: str, color: str, linestyle: str
+    ) -> bool:
+        values_a = history.get(key_a, [])
+        values_b = history.get(key_b, [])
+        if not values_a or not values_b:
+            return False
+        length = min(len(values_a), len(values_b))
+        values = np.asarray(values_a[:length], dtype=float) + np.asarray(
+            values_b[:length], dtype=float
+        )
+        return plot_values(ax, values, label, color, linestyle)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    plotted = False
+    plotted |= plot_sum_series(
+        ax, "reconstruction_loss", "kl_loss", "Train ELBO", "#8ecae6", "-"
+    )
+    plotted |= plot_sum_series(
+        ax,
+        "val_reconstruction_loss",
+        "val_kl_loss",
+        "Val ELBO",
+        "#023e8a",
+        "--",
+    )
+    plotted |= plot_series(
+        ax, "reconstruction_loss", "Train recon", "#f6bd60", "-"
+    )
+    plotted |= plot_series(
+        ax, "val_reconstruction_loss", "Val recon", "#d97706", "--"
+    )
+    plotted |= plot_series(ax, "kl_loss", "Train KL", "#95d5b2", "-")
+    plotted |= plot_series(ax, "val_kl_loss", "Val KL", "#2d6a4f", "--")
+    plotted |= plot_series(
+        ax, "histogram_distance", "Train histogram", "#f4a3a3", "-"
+    )
+    plotted |= plot_series(
+        ax, "val_histogram_distance", "Val histogram", "#9b1c1c", "--"
+    )
+
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Metric value")
+    if plotted:
+        ax.set_yscale("log")
+        ax.yaxis.set_major_locator(LogLocator(base=10.0))
+        ax.yaxis.set_major_formatter(LogFormatterMathtext(base=10.0))
+        ax.grid(True, which="both", alpha=0.22)
+        ax.legend(frameon=False, ncol=2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
 
 
 def best_metric_from_history(history: dict[str, list[Any]], key: str) -> tuple[float | None, int | None]:
     values = history.get(key, [])
     if not values:
         return None, None
-    best_epoch = int(np.argmin(values))
-    return float(values[best_epoch]), best_epoch
+    series = np.asarray(values, dtype=float)
+    finite = np.isfinite(series)
+    if not np.any(finite):
+        return None, None
+    finite_indexes = np.flatnonzero(finite)
+    best_epoch = int(finite_indexes[np.argmin(series[finite])])
+    return float(series[best_epoch]), best_epoch
 
 
 def tensorflow_gpu_status() -> dict[str, Any]:
@@ -210,6 +342,19 @@ def main() -> None:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
     if args.early_stopping_min_delta < 0:
         raise ValueError("--early-stopping-min-delta must be non-negative.")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be non-negative.")
+    if args.free_bits is not None and args.free_bits < 0:
+        raise ValueError("--free-bits must be non-negative.")
+    if args.kl_anneal_epochs is not None and args.kl_anneal_epochs < 0:
+        raise ValueError("--kl-anneal-epochs must be non-negative.")
+
+    monitor_metric = args.monitor_metric or "val_total_loss"
+    if args.disable_train_histogram_distance and monitor_metric == "histogram_distance":
+        raise ValueError(
+            "--disable-train-histogram-distance cannot be used with "
+            "--monitor-metric histogram_distance. Use val_histogram_distance instead."
+        )
 
     run_dir = args.run_dir
     model_dir = run_dir / "best_model"
@@ -226,9 +371,19 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "free_bits": hyperparameters.get("free_bits"),
+            "kl_anneal_epochs": hyperparameters.get("kl_anneal_epochs"),
             "loss_mode": args.loss_mode,
+            "histogram_distance_backend": args.histogram_distance_backend,
+            "compute_train_histogram_distance": (
+                not args.disable_train_histogram_distance
+            ),
         }
     )
+    if args.free_bits is not None:
+        hyperparameters["free_bits"] = args.free_bits
+    if args.kl_anneal_epochs is not None:
+        hyperparameters["kl_anneal_epochs"] = args.kl_anneal_epochs
 
     gpu_status = tensorflow_gpu_status()
     config = {
@@ -241,6 +396,13 @@ def main() -> None:
         "max_epochs": args.max_epochs,
         "early_stopping_start_epoch": args.early_stopping_start_epoch,
         "early_stopping_min_delta": args.early_stopping_min_delta,
+        "early_stopping_patience": args.early_stopping_patience,
+        "monitor_metric": monitor_metric,
+        "histogram_distance_backend": args.histogram_distance_backend,
+        "compute_train_histogram_distance": (
+            not args.disable_train_histogram_distance
+        ),
+        "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
         "loss_mode": args.loss_mode,
         "require_gpu": args.require_gpu,
         "gpu_status": gpu_status,
@@ -284,8 +446,11 @@ def main() -> None:
             valid_data=scaled_valid_data,
             max_epochs=args.max_epochs,
             verbose=args.verbose,
+            early_stopping_patience=args.early_stopping_patience,
             early_stopping_min_delta=args.early_stopping_min_delta,
             early_stopping_start_epoch=args.early_stopping_start_epoch,
+            monitor_metric=monitor_metric,
+            reduce_lr_on_plateau=args.enable_reduce_lr_on_plateau,
         )
         history = history_obj.history
         logger.log_history(history)
@@ -303,14 +468,16 @@ def main() -> None:
                 output_file=str(run_dir / f"{args.vae_type}_{args.run_id}_prior_samples.npz"),
             )
 
-        best_val, best_epoch = best_metric_from_history(history, "val_total_loss")
+        best_val_total_loss, _ = best_metric_from_history(history, "val_total_loss")
+        best_monitor_value, best_epoch = best_metric_from_history(history, monitor_metric)
         if getattr(vae_model, "best_monitor_value", None) not in (None, np.inf):
-            best_val = float(vae_model.best_monitor_value)
+            best_monitor_value = float(vae_model.best_monitor_value)
             best_epoch = None if vae_model.best_epoch is None else int(vae_model.best_epoch)
     except Exception as exc:
         status = "failed"
         error = repr(exc)
-        best_val = None
+        best_val_total_loss = None
+        best_monitor_value = None
         best_epoch = None
         raise
     finally:
@@ -332,14 +499,24 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "free_bits": hyperparameters.get("free_bits"),
+            "kl_anneal_epochs": hyperparameters.get("kl_anneal_epochs"),
             "loss_mode": args.loss_mode,
             "valid_perc": args.valid_perc,
             "split_method": args.split_method,
             "early_stopping_start_epoch": args.early_stopping_start_epoch,
             "early_stopping_min_delta": args.early_stopping_min_delta,
+            "early_stopping_patience": args.early_stopping_patience,
+            "monitor_metric": monitor_metric,
+            "histogram_distance_backend": args.histogram_distance_backend,
+            "compute_train_histogram_distance": (
+                not args.disable_train_histogram_distance
+            ),
+            "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             "require_gpu": args.require_gpu,
             "gpu_status": gpu_status,
-            "best_val_total_loss": best_val,
+            "best_val_total_loss": best_val_total_loss,
+            "best_monitor_value": best_monitor_value,
             "best_epoch": best_epoch,
             "run_dir": str(run_dir),
             **timing,

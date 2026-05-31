@@ -18,6 +18,16 @@ from typing import Any
 import paths
 
 
+MONITOR_METRIC_CHOICES = (
+    "total_loss",
+    "val_total_loss",
+    "histogram_distance",
+    "val_histogram_distance",
+)
+
+HISTOGRAM_DISTANCE_BACKEND_CHOICES = ("numpy", "tensorflow")
+
+
 RESULT_FIELDS = [
     "run_id",
     "status",
@@ -28,12 +38,20 @@ RESULT_FIELDS = [
     "reconstruction_wt",
     "learning_rate",
     "batch_size",
+    "free_bits",
+    "kl_anneal_epochs",
     "loss_mode",
     "valid_perc",
     "split_method",
     "early_stopping_start_epoch",
     "early_stopping_min_delta",
+    "early_stopping_patience",
+    "monitor_metric",
+    "histogram_distance_backend",
+    "compute_train_histogram_distance",
+    "reduce_lr_on_plateau",
     "best_val_total_loss",
+    "best_monitor_value",
     "best_epoch",
     "duration_seconds",
     "gpu_id",
@@ -56,14 +74,45 @@ def parse_args() -> argparse.Namespace:
             "tail_holdout reserves the final valid-percentage samples for "
             "validation, then shuffles only training data; "
             "full_train_recent_blocks uses all samples for training and "
-            "copies validation from three recent 122-sample blocks."
+            "copies validation from three recent 122-day/488-sample blocks."
         ),
     )
     parser.add_argument("--latent-dim", type=int, nargs="+", required=True)
     parser.add_argument("--reconstruction-wt", type=float, nargs="+", required=True)
     parser.add_argument("--learning-rate", type=float, nargs="+", required=True)
     parser.add_argument("--batch-size", type=int, nargs="+", required=True)
+    parser.add_argument(
+        "--free-bits",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Optional grid values for VAE free bits. Defaults to hyperparameters.yaml when omitted.",
+    )
+    parser.add_argument(
+        "--kl-anneal-epochs",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Optional grid values for VAE KL annealing epochs. Defaults to hyperparameters.yaml when omitted.",
+    )
     parser.add_argument("--max-epochs", type=int, default=1000)
+    parser.add_argument(
+        "--histogram-distance-backend",
+        choices=HISTOGRAM_DISTANCE_BACKEND_CHOICES,
+        default="numpy",
+        help=(
+            "Backend for batch histogram_distance monitoring in child runs. "
+            "numpy matches rerun semantics most closely; tensorflow avoids per-batch NumPy callbacks."
+        ),
+    )
+    parser.add_argument(
+        "--disable-train-histogram-distance",
+        action="store_true",
+        help=(
+            "Skip histogram_distance during training batches in child runs. "
+            "Validation histogram distance is still computed."
+        ),
+    )
     parser.add_argument(
         "--loss-mode",
         choices=("current", "legacy"),
@@ -81,6 +130,29 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1e-4,
         help="Pass-through to train_single_vae.py; minimum monitored-loss improvement required by early stopping.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=50,
+        help="Pass-through to train_single_vae.py; unimproved monitored epochs to tolerate before early stopping.",
+    )
+    parser.add_argument(
+        "--monitor-metric",
+        choices=MONITOR_METRIC_CHOICES,
+        default=None,
+        help=(
+            "Metric used by child runs for best-weight restore, early stopping, "
+            "optional LR reduction, and HPO best-run selection. Defaults to val_total_loss."
+        ),
+    )
+    parser.add_argument(
+        "--enable-reduce-lr-on-plateau",
+        action="store_true",
+        help=(
+            "Enable Keras ReduceLROnPlateau in child runs. Disabled by default. "
+            "When enabled, it monitors --monitor-metric with factor=0.5 and patience=30."
+        ),
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-slots", required=True, help="GPU concurrency map, e.g. 0:2,1:2,2:4. Use none:1 for CPU.")
@@ -214,19 +286,37 @@ def extend_ld_library_path(env: dict[str, str], extra_dirs: list[str]) -> None:
 
 def build_jobs(args: argparse.Namespace, datasets: list[str], output_dir: Path) -> list[dict[str, Any]]:
     jobs = []
+    free_bits_values = args.free_bits if args.free_bits is not None else [None]
+    kl_anneal_epochs_values = (
+        args.kl_anneal_epochs if args.kl_anneal_epochs is not None else [None]
+    )
     combos = itertools.product(
         datasets,
         args.latent_dim,
         args.reconstruction_wt,
         args.learning_rate,
         args.batch_size,
+        free_bits_values,
+        kl_anneal_epochs_values,
     )
-    for idx, (dataset, latent_dim, reconstruction_wt, learning_rate, batch_size) in enumerate(combos):
+    for idx, (
+        dataset,
+        latent_dim,
+        reconstruction_wt,
+        learning_rate,
+        batch_size,
+        free_bits,
+        kl_anneal_epochs,
+    ) in enumerate(combos):
         run_id = (
             f"run_{idx:05d}_"
             f"{slug(dataset)}_"
             f"ld{latent_dim}_rw{reconstruction_wt}_lr{learning_rate}_bs{batch_size}"
         )
+        if free_bits is not None:
+            run_id += f"_fb{free_bits}"
+        if kl_anneal_epochs is not None:
+            run_id += f"_ka{kl_anneal_epochs}"
         run_dir = output_dir / "runs" / run_id
         jobs.append(
             {
@@ -237,11 +327,20 @@ def build_jobs(args: argparse.Namespace, datasets: list[str], output_dir: Path) 
                 "reconstruction_wt": reconstruction_wt,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
+                "free_bits": free_bits,
+                "kl_anneal_epochs": kl_anneal_epochs,
                 "loss_mode": args.loss_mode,
                 "valid_perc": args.valid_perc,
                 "split_method": args.split_method,
                 "early_stopping_start_epoch": args.early_stopping_start_epoch,
                 "early_stopping_min_delta": args.early_stopping_min_delta,
+                "early_stopping_patience": args.early_stopping_patience,
+                "monitor_metric": args.monitor_metric,
+                "histogram_distance_backend": args.histogram_distance_backend,
+                "compute_train_histogram_distance": (
+                    not args.disable_train_histogram_distance
+                ),
+                "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             }
         )
     return jobs
@@ -280,10 +379,16 @@ def launch_job(
         str(args.max_epochs),
         "--loss-mode",
         args.loss_mode,
+        "--histogram-distance-backend",
+        args.histogram_distance_backend,
         "--early-stopping-start-epoch",
         str(args.early_stopping_start_epoch),
         "--early-stopping-min-delta",
         str(args.early_stopping_min_delta),
+        "--early-stopping-patience",
+        str(args.early_stopping_patience),
+        "--monitor-metric",
+        args.monitor_metric,
         "--seed",
         str(args.seed),
         "--run-dir",
@@ -297,6 +402,14 @@ def launch_job(
         "--verbose",
         str(args.verbose),
     ]
+    if job["free_bits"] is not None:
+        cmd.extend(["--free-bits", str(job["free_bits"])])
+    if job["kl_anneal_epochs"] is not None:
+        cmd.extend(["--kl-anneal-epochs", str(job["kl_anneal_epochs"])])
+    if args.disable_train_histogram_distance:
+        cmd.append("--disable-train-histogram-distance")
+    if args.enable_reduce_lr_on_plateau:
+        cmd.append("--enable-reduce-lr-on-plateau")
     if args.wandb_entity:
         cmd.extend(["--wandb-entity", args.wandb_entity])
     if args.generate_after_train:
@@ -327,13 +440,39 @@ def read_result(job: dict[str, Any], gpu_id: str, return_code: int) -> dict[str,
             "reconstruction_wt": job["reconstruction_wt"],
             "learning_rate": job["learning_rate"],
             "batch_size": job["batch_size"],
+            "free_bits": job["free_bits"],
+            "kl_anneal_epochs": job["kl_anneal_epochs"],
             "loss_mode": job["loss_mode"],
             "valid_perc": job["valid_perc"],
             "split_method": job["split_method"],
             "early_stopping_start_epoch": job["early_stopping_start_epoch"],
             "early_stopping_min_delta": job["early_stopping_min_delta"],
+            "early_stopping_patience": job["early_stopping_patience"],
+            "monitor_metric": job["monitor_metric"],
+            "histogram_distance_backend": job["histogram_distance_backend"],
+            "compute_train_histogram_distance": job[
+                "compute_train_histogram_distance"
+            ],
+            "reduce_lr_on_plateau": job["reduce_lr_on_plateau"],
+            "best_monitor_value": None,
             "run_dir": str(job["run_dir"]),
         }
+    result.setdefault("free_bits", job["free_bits"])
+    result.setdefault("kl_anneal_epochs", job["kl_anneal_epochs"])
+    result.setdefault("monitor_metric", job["monitor_metric"])
+    result.setdefault(
+        "histogram_distance_backend", job["histogram_distance_backend"]
+    )
+    result.setdefault(
+        "compute_train_histogram_distance",
+        job["compute_train_histogram_distance"],
+    )
+    result.setdefault("reduce_lr_on_plateau", job["reduce_lr_on_plateau"])
+    if (
+        result.get("best_monitor_value") is None
+        and result.get("monitor_metric") == "val_total_loss"
+    ):
+        result["best_monitor_value"] = result.get("best_val_total_loss")
     result["gpu_id"] = gpu_id
     return result
 
@@ -344,6 +483,20 @@ def main() -> None:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
     if args.early_stopping_min_delta < 0:
         raise ValueError("--early-stopping-min-delta must be non-negative.")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience must be non-negative.")
+    if args.free_bits is not None and any(value < 0 for value in args.free_bits):
+        raise ValueError("--free-bits values must be non-negative.")
+    if args.kl_anneal_epochs is not None and any(
+        value < 0 for value in args.kl_anneal_epochs
+    ):
+        raise ValueError("--kl-anneal-epochs values must be non-negative.")
+    args.monitor_metric = args.monitor_metric or "val_total_loss"
+    if args.disable_train_histogram_distance and args.monitor_metric == "histogram_distance":
+        raise ValueError(
+            "--disable-train-histogram-distance cannot be used with "
+            "--monitor-metric histogram_distance. Use val_histogram_distance instead."
+        )
     datasets = collect_datasets(args)
     gpu_slots = parse_gpu_slots(args.gpu_slots)
     output_dir = resolve_output_dir(args, datasets)
@@ -361,6 +514,8 @@ def main() -> None:
             "reconstruction_wt": args.reconstruction_wt,
             "learning_rate": args.learning_rate,
             "batch_size": args.batch_size,
+            "free_bits": args.free_bits,
+            "kl_anneal_epochs": args.kl_anneal_epochs,
             "loss_mode": args.loss_mode,
             "max_epochs": args.max_epochs,
             "experiment_group": args.experiment_group,
@@ -370,6 +525,13 @@ def main() -> None:
             "nvidia_library_dirs": pip_nvidia_library_dirs(),
             "early_stopping_start_epoch": args.early_stopping_start_epoch,
             "early_stopping_min_delta": args.early_stopping_min_delta,
+            "early_stopping_patience": args.early_stopping_patience,
+            "monitor_metric": args.monitor_metric,
+            "histogram_distance_backend": args.histogram_distance_backend,
+            "compute_train_histogram_distance": (
+                not args.disable_train_histogram_distance
+            ),
+            "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             "seed": args.seed,
             "gpu_slots": args.gpu_slots,
             "num_jobs": len(jobs),
@@ -408,16 +570,32 @@ def main() -> None:
             results.append(result)
             append_jsonl(results_jsonl, result)
             write_results_csv(output_dir / "results.csv", results)
-            print("Finished {} status={} best_val={}".format(result["run_id"], result.get("status"), result.get("best_val_total_loss")))
+            print(
+                "Finished {} status={} {}={}".format(
+                    result["run_id"],
+                    result.get("status"),
+                    args.monitor_metric,
+                    result.get("best_monitor_value"),
+                )
+            )
         running = still_running
 
-    completed = [r for r in results if r.get("status") == "completed" and r.get("best_val_total_loss") is not None]
+    completed = [
+        r
+        for r in results
+        if r.get("status") == "completed"
+        and r.get("best_monitor_value") is not None
+    ]
     if completed:
-        best = min(completed, key=lambda r: float(r["best_val_total_loss"]))
+        best = min(completed, key=lambda r: float(r["best_monitor_value"]))
         write_json(output_dir / "best_run.json", best)
-        print("Best run: {} val_total_loss={}".format(best["run_id"], best["best_val_total_loss"]))
+        print(
+            "Best run: {} {}={}".format(
+                best["run_id"], args.monitor_metric, best["best_monitor_value"]
+            )
+        )
     else:
-        print("No completed runs with best_val_total_loss were found.")
+        print(f"No completed runs with {args.monitor_metric} were found.")
 
 
 if __name__ == "__main__":

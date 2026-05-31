@@ -86,6 +86,7 @@ The four key hyperparameters for the VAE models are:
 - `hidden_layer_sizes`: Number of hidden units or filters (default: [50, 100, 200]).
 - `reconstruction_wt`: Weight for the reconstruction loss (default: 3.0).
 - `batch_size`: Training batch size (default: 16).
+- `kl_anneal_epochs`: Number of epochs used to linearly ramp KL weight from 0 to 1 (default: 50).
 
 For `timeVAE`:
 
@@ -201,10 +202,12 @@ python src/hpo_grid_search.py \
   --dataset new_npz_data/weather_data/T84/weather_london_2003_2015 \
   --vae-type timeVAE \
   --valid-perc 0.1 \
+  --split-method tail_holdout \
   --latent-dim 4 8 16 \
   --reconstruction-wt 1.0 3.0 5.0 \
   --learning-rate 0.001 0.0005 \
   --batch-size 16 32 \
+  --kl-anneal-epochs 50 200 500 \
   --max-epochs 1000 \
   --seed 42 \
   --gpu-slots 0:2,1:2,2:4
@@ -223,16 +226,42 @@ python src/hpo_grid_search.py \
   --gpu-slots 0:1
 ```
 
+Important HPO and training options:
+
+- `--valid-perc`: validation fraction for `--split-method tail_holdout`.
+- `--split-method`: validation split strategy. Choices are:
+  - `tail_holdout` (default): reserve the final `valid_perc` fraction of samples for validation, then shuffle only the training split.
+  - `full_train_recent_blocks`: use all samples for training and copy validation from three recent fixed 122-day/488-sample blocks. This protocol requires at least 4384 samples and is intended for the weather recent-block experiments.
+- `--free-bits`: optional HPO grid values for the VAE free-bits floor, for example `--free-bits 0.1 0.01 0.001`. Omit it to use `src/config/hyperparameters.yaml`.
+- `--kl-anneal-epochs`: optional HPO grid values for the VAE KL annealing schedule, for example `--kl-anneal-epochs 50 200 500`. Omit it to use `src/config/hyperparameters.yaml`.
+- `--histogram-distance-backend`: backend for batch histogram-distance monitoring. Choices are `numpy` (default, closest to rerun behavior) and `tensorflow` (avoids per-batch NumPy callbacks and can reduce CPU/Python overhead).
+- `--disable-train-histogram-distance`: skip training-batch histogram monitoring while still computing validation histogram distance. Useful when HPO monitors `val_histogram_distance`.
+- `--monitor-metric`: metric used for best-weight restore, early stopping, optional learning-rate reduction, and HPO best-run selection. Choices are `val_total_loss` (default), `total_loss`, `val_histogram_distance`, and `histogram_distance`.
+- `--early-stopping-min-delta`: minimum improvement required in the selected monitor metric before early stopping considers an epoch improved. Use this to control HPO min delta.
+- `--early-stopping-patience`: number of unimproved monitored epochs to tolerate before early stopping. Defaults to `50`.
+- `--early-stopping-start-epoch`: zero-based epoch before which early-stopping patience is not counted.
+- `--enable-reduce-lr-on-plateau`: enable `ReduceLROnPlateau`; disabled by default. When enabled, it monitors `--monitor-metric` with factor `0.5` and patience `30`.
+
+For example, to select the best HPO run by validation histogram distance instead of validation loss:
+
+```bash
+python src/hpo_grid_search.py ... \
+  --monitor-metric val_histogram_distance \
+  --early-stopping-min-delta 1e-4
+```
+
 Each HPO run writes its own directory under `outputs/hpo/<timestamp>/runs/` with:
 
-- `config.json`: dataset, seed, and hyperparameters for the run.
-- `history.csv`: epoch metrics including `total_loss` and `val_total_loss`.
+- `config.json`: dataset, seed, split method, monitor metric, and hyperparameters for the run.
+- `history.csv`: epoch metrics including loss terms and histogram distance metrics.
 - `timing.json`: start time, end time, and duration in seconds.
-- `loss_curve.png`: train and validation total loss curves.
-- `best_model/`: scaler and the best validation-loss model weights.
+- `loss_curve.png`: train/validation ELBO-style curves (`reconstruction_loss + kl_loss`), unweighted reconstruction loss, KL loss, and histogram distance.
+- `best_model/`: scaler and model weights restored from the best epoch for the selected monitor metric.
 
 The sweep root also contains `results.csv`, `results.jsonl`, `search_config.json`, and
-`best_run.json`. The best run is selected by minimum `best_val_total_loss`.
+`best_run.json`. The best run is selected by the minimum `best_monitor_value`, which
+corresponds to the chosen `--monitor-metric`. `best_val_total_loss` is still recorded
+for backward-compatible comparison when available.
 
 Optional Weights & Biases logging is available but disabled by default:
 
@@ -247,8 +276,8 @@ from the selected `best_model/`.
 
 ## Generate From Best HPO Run
 
-After a grid search finishes, use the selected best run to generate prior samples and
-a t-SNE comparison plot without retraining:
+After a grid search finishes, use the selected best run to generate prior samples,
+a t-SNE comparison plot, and feature-level distribution diagnostics without retraining:
 
 ```bash
 python src/rerun_best_hpo.py \
@@ -262,9 +291,11 @@ Input notes:
 
 - `--best-run`: path to the HPO sweep-level `best_run.json`.
 - `--num-samples`: generated prior sample count. Use `train`, `valid`, `all`, or an integer.
-- `--compare-split`: original split for t-SNE comparison: `train`, `valid`, or `all`.
+- `--compare-split`: original split for t-SNE and distribution comparison: `train`, `valid`, or `all`.
 - `--max-tsne-samples`: maximum samples per side used in t-SNE.
+- `--num-bins`: optional histogram bin count for distribution metrics.
 - `--output-dir`: optional override for output location.
+- `--existing-generated-npz`: use an existing inverse-scaled generated `.npz` and only rerun evaluation outputs.
 - `--save-scaled`: additionally save generated samples before inverse scaling.
 - `--no-tsne`: skip t-SNE generation.
 
@@ -273,14 +304,41 @@ By default, outputs are written to the selected run directory:
 ```plaintext
 outputs/hpo/<timestamp>/runs/<best_run_id>/best_outputs/
 ├── <vae_type>_<dataset_name>_best_prior_samples.npz
+├── feature_statistics.csv
+├── feature_distribution_histograms.pdf
 ├── tsne_generated_vs_<compare_split>.png
 └── rerun_config.json
 ```
 
 Prior sampling draws latent vectors from `N(0, I)` and decodes them; it does not use
-input samples except to choose default sizes, load the scaler, and build the t-SNE
-comparison set.
+input samples except to choose default sizes, load the scaler, build the t-SNE
+comparison set, and choose the requested real split for distribution metrics.
 
+To evaluate synthetic data from another method stored as a CSV, use the same best-run
+configuration without loading VAE weights:
+
+```bash
+python src/evaluate_external_csv.py \
+  --synthetic-csv ../Sonnet/datasets/synthetic_weather/2003_2013_5feature/iaaft_mv_rerun/capetown/capetown_surrogate_0001.csv \
+  --best-run outputs/hpo/<timestamp>/best_run.json \
+  --compare-split train \
+  --max-tsne-samples 2000
+```
+
+For an already generated prior-sample `.npz`, add `--existing-generated-npz` to
+regenerate only evaluation artifacts without resampling or overwriting the sample file:
+
+```bash
+python src/rerun_best_hpo.py \
+  --best-run outputs/hpo/<timestamp>/best_run.json \
+  --existing-generated-npz outputs/rerunbest/weather20062015/capetown_2006_2015_T40/timeVAE_weather_capetown_2006_2015_best_prior_samples.npz \
+  --compare-split train \
+  --no-tsne \
+  --output-dir outputs/rerunbest/weather20062015/capetown_2006_2015_T40
+```
+
+The external CSV is windowed with the original dataset sequence length, defaults to
+`--stride 1`, and uses the original NPZ `feature_cols` order when available.
 
 ## Plot Generated vs Original NPZ Samples
 

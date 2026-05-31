@@ -93,8 +93,11 @@ def train_vae(
     max_epochs,
     verbose=0,
     valid_data=None,
+    early_stopping_patience=50,
     early_stopping_min_delta=1e-4,
     early_stopping_start_epoch=0,
+    monitor_metric=None,
+    reduce_lr_on_plateau=False,
 ):
     """
     Train a VAE model.
@@ -113,8 +116,11 @@ def train_vae(
         valid_data=valid_data,
         max_epochs=max_epochs,
         verbose=verbose,
+        early_stopping_patience=early_stopping_patience,
         early_stopping_min_delta=early_stopping_min_delta,
         early_stopping_start_epoch=early_stopping_start_epoch,
+        monitor_metric=monitor_metric,
+        reduce_lr_on_plateau=reduce_lr_on_plateau,
     )
 
 

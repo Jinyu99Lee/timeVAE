@@ -60,24 +60,25 @@ def _full_train_recent_blocks_valid_data(data: np.ndarray) -> np.ndarray:
     Build a validation set by copying three recent-year sample blocks.
 
     The slices are expressed on the sample axis and intentionally match the
-    experiment protocol:
-    - last year's last 122 samples: data[-122:]
-    - second-last year's middle 122 samples: data[-365-244:-365-122]
-    - third-last year's earliest 122 samples: data[-730-366:-730-244]
+    experiment protocol. Each block spans 122 days at 4 samples per day:
+    - last year's last 488 samples: data[-488:]
+    - second-last year's middle 488 samples: data[-2436:-1948]
+    - third-last year's earliest 488 samples: data[-4384:-3896]
     """
+    expected_block_size = 488
+    min_required_samples = 4384
     valid_slices = (
-        slice(-122, None),
-        slice(-365 - 244, -365 - 122),
-        slice(-730 - 366, -730 - 244),
+        slice(-488, None),
+        slice(-1460 - 976, -1460 - 488),
+        slice(-2920 - 1464, -2920 - 976),
     )
-    if data.shape[0] < 1096:
+    if data.shape[0] < min_required_samples:
         raise ValueError(
-            "split_method='full_train_recent_blocks' requires at least 1096 "
-            f"samples, got {data.shape[0]}."
+            "split_method='full_train_recent_blocks' requires at least "
+            f"{min_required_samples} samples, got {data.shape[0]}."
         )
 
     valid_parts = [data[valid_slice].copy() for valid_slice in valid_slices]
-    expected_block_size = 122
     for idx, valid_part in enumerate(valid_parts):
         if valid_part.shape[0] != expected_block_size:
             raise ValueError(

@@ -32,7 +32,7 @@ class VariationalAutoencoderConv(BaseVariationalAutoencoder):
         self.hidden_layer_sizes = hidden_layer_sizes
         self.encoder = self._get_encoder()
         self.decoder = self._get_decoder()
-        self.compile(optimizer=Adam(learning_rate=self.learning_rate))
+        self.compile(optimizer=Adam(learning_rate=self.learning_rate), jit_compile=False)
 
     def _get_encoder(self):
         encoder_inputs = Input(
@@ -107,5 +107,5 @@ class VariationalAutoencoderConv(BaseVariationalAutoencoder):
         dict_params = joblib.load(params_file)
         vae_model = VariationalAutoencoderConv(**dict_params)
         vae_model.load_weights(model_dir)
-        vae_model.compile(optimizer=Adam(learning_rate=vae_model.learning_rate))
+        vae_model.compile(optimizer=Adam(learning_rate=vae_model.learning_rate), jit_compile=False)
         return vae_model

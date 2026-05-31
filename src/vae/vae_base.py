@@ -14,6 +14,130 @@ from tensorflow.keras.backend import random_normal
 from tensorflow.keras.callbacks import Callback, EarlyStopping, ReduceLROnPlateau
 
 
+def _freedman_diaconis_num_bins(num_values: int) -> int:
+    if num_values <= 0:
+        return 1
+    return max(1, int(round(2.0 * np.power(num_values, 1.0 / 3.0), 0)))
+
+
+def _histogram_distance_1d_np(
+    real_values: np.ndarray, synthetic_values: np.ndarray, num_bins: int
+) -> float:
+    real_values = real_values[np.isfinite(real_values)]
+    synthetic_values = synthetic_values[np.isfinite(synthetic_values)]
+    if real_values.size == 0 or synthetic_values.size == 0:
+        return float("nan")
+
+    min_val = float(np.min(real_values))
+    max_val = float(np.max(real_values))
+    if abs(max_val - min_val) < 1e-10:
+        min_val -= 1e-5
+        max_val += 1e-5
+
+    bins = np.linspace(min_val, max_val, num_bins + 1)
+    real_counts, _ = np.histogram(real_values, bins=bins)
+    synthetic_counts, _ = np.histogram(synthetic_values, bins=bins)
+
+    real_density = real_counts / real_values.size * num_bins
+    synthetic_density = synthetic_counts / synthetic_values.size * num_bins
+    abs_metric = float(np.mean(np.abs(real_density - synthetic_density)))
+    out_of_bounds = float(
+        np.mean((synthetic_values < bins[0]) | (synthetic_values > bins[-1]))
+    )
+    return (abs_metric + out_of_bounds) / 2.0
+
+
+def _batch_histogram_distance_np(
+    real_data: np.ndarray, synthetic_data: np.ndarray
+) -> np.float32:
+    real_data = np.asarray(real_data, dtype=float)
+    synthetic_data = np.asarray(synthetic_data, dtype=float)
+    if real_data.ndim != 3 or synthetic_data.ndim != 3:
+        return np.float32(np.nan)
+    if real_data.shape[1:] != synthetic_data.shape[1:]:
+        return np.float32(np.nan)
+
+    num_bins = _freedman_diaconis_num_bins(int(real_data.shape[0] * real_data.shape[1]))
+    distances = []
+    for feature_idx in range(real_data.shape[2]):
+        real_values = real_data[:, :, feature_idx].reshape(-1)
+        synthetic_values = synthetic_data[:, :, feature_idx].reshape(-1)
+        distances.append(
+            _histogram_distance_1d_np(real_values, synthetic_values, num_bins)
+        )
+    if not distances:
+        return np.float32(np.nan)
+    return np.float32(np.nanmean(np.asarray(distances, dtype=float)))
+
+
+def _freedman_diaconis_num_bins_tf(num_values):
+    num_values_float = tf.cast(tf.maximum(num_values, 1), tf.float32)
+    num_bins = tf.cast(
+        tf.round(2.0 * tf.pow(num_values_float, 1.0 / 3.0)), tf.int32
+    )
+    return tf.maximum(num_bins, 1)
+
+
+def _histogram_counts_tf(values, min_val, max_val, num_bins, count_out_of_bounds):
+    num_values = tf.shape(values)[0]
+    num_features = tf.shape(values)[1]
+    num_bins_float = tf.cast(num_bins, values.dtype)
+    width = (max_val - min_val) / num_bins_float
+    raw_bins = tf.floor((values - min_val) / width)
+    bin_ids = tf.clip_by_value(tf.cast(raw_bins, tf.int32), 0, num_bins - 1)
+
+    in_bounds = tf.logical_and(values >= min_val, values <= max_val)
+    if count_out_of_bounds:
+        weights = tf.cast(in_bounds, tf.float32)
+    else:
+        weights = tf.ones_like(values, dtype=tf.float32)
+
+    feature_ids = tf.tile(tf.range(num_features)[tf.newaxis, :], [num_values, 1])
+    segment_ids = tf.reshape(feature_ids * num_bins + bin_ids, [-1])
+    counts = tf.math.unsorted_segment_sum(
+        tf.reshape(weights, [-1]),
+        segment_ids,
+        num_segments=num_features * num_bins,
+    )
+    return tf.reshape(counts, [num_features, num_bins])
+
+
+def _batch_histogram_distance_tf(real_data, synthetic_data):
+    real_data = tf.cast(real_data, tf.float32)
+    synthetic_data = tf.cast(synthetic_data, tf.float32)
+    real_values = tf.reshape(real_data, [-1, tf.shape(real_data)[2]])
+    synthetic_values = tf.reshape(synthetic_data, [-1, tf.shape(synthetic_data)[2]])
+
+    num_values = tf.shape(real_values)[0]
+    num_bins = _freedman_diaconis_num_bins_tf(num_values)
+    min_val = tf.reduce_min(real_values, axis=0)
+    max_val = tf.reduce_max(real_values, axis=0)
+    constant_features = tf.abs(max_val - min_val) < 1e-10
+    min_val = tf.where(constant_features, min_val - 1e-5, min_val)
+    max_val = tf.where(constant_features, max_val + 1e-5, max_val)
+
+    real_counts = _histogram_counts_tf(
+        real_values, min_val, max_val, num_bins, count_out_of_bounds=False
+    )
+    synthetic_counts = _histogram_counts_tf(
+        synthetic_values, min_val, max_val, num_bins, count_out_of_bounds=True
+    )
+
+    density_scale = tf.cast(num_bins, tf.float32) / tf.cast(num_values, tf.float32)
+    real_density = real_counts * density_scale
+    synthetic_density = synthetic_counts * density_scale
+    abs_metric = tf.reduce_mean(tf.abs(real_density - synthetic_density), axis=1)
+
+    out_of_bounds = tf.reduce_mean(
+        tf.cast(
+            tf.logical_or(synthetic_values < min_val, synthetic_values > max_val),
+            tf.float32,
+        ),
+        axis=0,
+    )
+    return tf.reduce_mean((abs_metric + out_of_bounds) / 2.0)
+
+
 class Sampling(Layer):
     """Uses (z_mean, z_log_var) to sample z, the vector encoding a digit."""
 
@@ -99,11 +223,17 @@ class BaseVariationalAutoencoder(Model, ABC):
         kl_anneal_epochs=50,
         free_bits=0.1,
         loss_mode="current",
+        histogram_distance_backend="numpy",
+        compute_train_histogram_distance=True,
         **kwargs,
     ):
         super(BaseVariationalAutoencoder, self).__init__(**kwargs)
         if loss_mode not in ("current", "legacy"):
             raise ValueError("loss_mode must be one of: current, legacy.")
+        if histogram_distance_backend not in ("numpy", "tensorflow"):
+            raise ValueError(
+                "histogram_distance_backend must be one of: numpy, tensorflow."
+            )
         self.seq_len = seq_len
         self.feat_dim = feat_dim
         self.latent_dim = latent_dim
@@ -113,10 +243,17 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.kl_anneal_epochs = kl_anneal_epochs
         self.free_bits = free_bits
         self.loss_mode = loss_mode
+        self.histogram_distance_backend = histogram_distance_backend
+        self.compute_train_histogram_distance = compute_train_histogram_distance
         self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = Mean(name="total_loss")
         self.reconstruction_loss_tracker = Mean(name="reconstruction_loss")
         self.kl_loss_tracker = Mean(name="kl_loss")
+        self.reconstruction_component_loss_tracker = Mean(
+            name="reconstruction_component_loss"
+        )
+        self.kl_component_loss_tracker = Mean(name="kl_component_loss")
+        self.histogram_distance_tracker = Mean(name="histogram_distance")
         self.encoder = None
         self.decoder = None
 
@@ -129,30 +266,41 @@ class BaseVariationalAutoencoder(Model, ABC):
         early_stopping_patience=50,
         early_stopping_min_delta=1e-4,
         early_stopping_start_epoch=0,
+        monitor_metric=None,
+        reduce_lr_on_plateau=False,
     ):
-        loss_to_monitor = "val_total_loss" if valid_data is not None else "total_loss"
+        if monitor_metric is None:
+            monitor_metric = "val_total_loss" if valid_data is not None else "total_loss"
+        if valid_data is None and monitor_metric.startswith("val_"):
+            raise ValueError(
+                f"monitor_metric={monitor_metric!r} requires validation data."
+            )
         best_weights = RestoreBestWeights(
-            monitor=loss_to_monitor,
+            monitor=monitor_metric,
             min_delta=early_stopping_min_delta,
             mode="min",
             start_epoch=early_stopping_start_epoch,
         )
         early_stopping = DelayedEarlyStopping(
             start_epoch=early_stopping_start_epoch,
-            monitor=loss_to_monitor,
+            monitor=monitor_metric,
             min_delta=early_stopping_min_delta,
             patience=early_stopping_patience,
             mode="min",
         )
-        reduce_lr = ReduceLROnPlateau(
-            monitor=loss_to_monitor, factor=0.5, patience=30, mode="min"
-        )
+        callbacks = [KLAnnealingCallback(), best_weights, early_stopping]
+        if reduce_lr_on_plateau:
+            callbacks.append(
+                ReduceLROnPlateau(
+                    monitor=monitor_metric, factor=0.5, patience=30, mode="min"
+                )
+            )
         return self.fit(
             train_data,
             validation_data=valid_data,
             epochs=max_epochs,
             batch_size=self.batch_size,
-            callbacks=[KLAnnealingCallback(), best_weights, early_stopping, reduce_lr],
+            callbacks=callbacks,
             verbose=verbose,
         )
 
@@ -162,6 +310,9 @@ class BaseVariationalAutoencoder(Model, ABC):
             self.total_loss_tracker,
             self.reconstruction_loss_tracker,
             self.kl_loss_tracker,
+            self.reconstruction_component_loss_tracker,
+            self.kl_component_loss_tracker,
+            self.histogram_distance_tracker,
         ]
 
     def call(self, X):
@@ -243,11 +394,29 @@ class BaseVariationalAutoencoder(Model, ABC):
             z_mean, z_log_var, apply_free_bits=apply_free_bits
         )
 
+    def _as_tensor(self, value):
+        if isinstance(value, (list, tuple)):
+            value = value[0]
+        return value
+
+    def _get_histogram_distance(self, X, X_recons):
+        X = tf.stop_gradient(X)
+        X_recons = tf.stop_gradient(X_recons)
+        if self.histogram_distance_backend == "tensorflow":
+            return _batch_histogram_distance_tf(X, X_recons)
+        histogram_distance = tf.numpy_function(
+            _batch_histogram_distance_np,
+            [X, X_recons],
+            tf.float32,
+        )
+        histogram_distance.set_shape(())
+        return histogram_distance
+
     def train_step(self, X):
         with tf.GradientTape() as tape:
             z_mean, z_log_var, z = self.encoder(X)
 
-            reconstruction = self.decoder(z)
+            reconstruction = self._as_tensor(self.decoder(z))
 
             reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
@@ -255,49 +424,100 @@ class BaseVariationalAutoencoder(Model, ABC):
 
             if self.loss_mode == "legacy":
                 total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
-            else:
-                total_loss = (
+                reconstruction_component_loss = (
                     self.reconstruction_wt * reconstruction_loss
-                    + self.kl_weight * kl_loss
                 )
+                kl_component_loss = total_loss - reconstruction_component_loss
+            else:
+                reconstruction_component_loss = (
+                    self.reconstruction_wt * reconstruction_loss
+                )
+                kl_component_loss = self.kl_weight * kl_loss
+                total_loss = reconstruction_component_loss + kl_component_loss
 
         grads = tape.gradient(total_loss, self.trainable_weights)
 
         self.optimizer.apply_gradients(zip(grads, self.trainable_weights))
 
-        self.total_loss_tracker.update_state(total_loss)
-        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
+        batch_size = tf.shape(X)[0]
+        sample_weight = tf.cast(batch_size, tf.float32)
+        self.total_loss_tracker.update_state(total_loss, sample_weight=sample_weight)
+        self.reconstruction_loss_tracker.update_state(
+            reconstruction_loss, sample_weight=sample_weight
+        )
+        self.kl_loss_tracker.update_state(kl_loss, sample_weight=sample_weight)
+        self.reconstruction_component_loss_tracker.update_state(
+            reconstruction_component_loss, sample_weight=sample_weight
+        )
+        self.kl_component_loss_tracker.update_state(
+            kl_component_loss, sample_weight=sample_weight
+        )
 
-        return {
+        logs = {
             "loss": self.total_loss_tracker.result(),
             "total_loss": self.total_loss_tracker.result(),
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
+            "reconstruction_component_loss": (
+                self.reconstruction_component_loss_tracker.result()
+            ),
+            "kl_component_loss": self.kl_component_loss_tracker.result(),
             "kl_weight": self.kl_weight,
         }
+        if self.compute_train_histogram_distance:
+            histogram_distance = self._get_histogram_distance(X, reconstruction)
+            self.histogram_distance_tracker.update_state(
+                histogram_distance, sample_weight=sample_weight
+            )
+            logs["histogram_distance"] = self.histogram_distance_tracker.result()
+        return logs
 
     def test_step(self, X):
         z_mean, z_log_var, z = self.encoder(X)
-        reconstruction = self.decoder(z)
+        reconstruction = self._as_tensor(self.decoder(z))
         reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
-        kl_loss = self._get_kl_loss(z_mean, z_log_var, apply_free_bits=False)
+        kl_loss = self._get_kl_loss(z_mean, z_log_var)
 
         if self.loss_mode == "legacy":
             total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
+            reconstruction_component_loss = self.reconstruction_wt * reconstruction_loss
+            kl_component_loss = total_loss - reconstruction_component_loss
         else:
+            reconstruction_component_loss = reconstruction_loss
+            kl_component_loss = kl_loss
             total_loss = reconstruction_loss + kl_loss
 
-        self.total_loss_tracker.update_state(total_loss)
-        self.reconstruction_loss_tracker.update_state(reconstruction_loss)
-        self.kl_loss_tracker.update_state(kl_loss)
+        batch_size = tf.shape(X)[0]
+        sample_weight = tf.cast(batch_size, tf.float32)
+        prior_z = tf.random.normal(shape=(batch_size, self.latent_dim), dtype=tf.float32)
+        prior_samples = self._as_tensor(self.decoder(prior_z))
+        histogram_distance = self._get_histogram_distance(X, prior_samples)
+        self.total_loss_tracker.update_state(total_loss, sample_weight=sample_weight)
+        self.reconstruction_loss_tracker.update_state(
+            reconstruction_loss, sample_weight=sample_weight
+        )
+        self.kl_loss_tracker.update_state(kl_loss, sample_weight=sample_weight)
+        self.reconstruction_component_loss_tracker.update_state(
+            reconstruction_component_loss, sample_weight=sample_weight
+        )
+        self.kl_component_loss_tracker.update_state(
+            kl_component_loss, sample_weight=sample_weight
+        )
+        self.histogram_distance_tracker.update_state(
+            histogram_distance, sample_weight=sample_weight
+        )
 
         return {
             "loss": self.total_loss_tracker.result(),
             "total_loss": self.total_loss_tracker.result(),
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
+            "reconstruction_component_loss": (
+                self.reconstruction_component_loss_tracker.result()
+            ),
+            "kl_component_loss": self.kl_component_loss_tracker.result(),
+            "histogram_distance": self.histogram_distance_tracker.result(),
         }
 
     def save_weights(self, model_dir):
@@ -335,6 +555,8 @@ class BaseVariationalAutoencoder(Model, ABC):
             "kl_anneal_epochs": self.kl_anneal_epochs,
             "free_bits": self.free_bits,
             "loss_mode": self.loss_mode,
+            "histogram_distance_backend": self.histogram_distance_backend,
+            "compute_train_histogram_distance": self.compute_train_histogram_distance,
             "hidden_layer_sizes": list(self.hidden_layer_sizes),
         }
         params_file = os.path.join(model_dir, f"{self.model_name}_parameters.pkl")

@@ -1,0 +1,44 @@
+{
+  "best_run_path": "/data/jinyuli/Projects/timeVAE/outputs/hpo/weather20062015/20260523_122951_london_2006_2015_timevae_grid/best_run.json",
+  "compare_split": "train",
+  "compare_split_size": 14525,
+  "dataset": "new_npz_data/weather_data/T84/weather_london_2006_2015",
+  "end_date": null,
+  "evaluation": {
+    "average_abs_mean_diff": 0.7262165703709779,
+    "average_abs_variance_diff": 1752.2456500125525,
+    "average_histogram_distance": 0.003404802885009424,
+    "average_wasserstein_1": 0.9866811656028371,
+    "feature_histograms_file": "outputs/external_eval/iaaft_london_2006_2015/feature_distribution_histograms.pdf",
+    "feature_statistics_file": "outputs/external_eval/iaaft_london_2006_2015/feature_statistics.csv",
+    "num_bins": 214
+  },
+  "model_dir": "/data/jinyuli/Projects/timeVAE/outputs/hpo/weather20062015/20260523_122951_london_2006_2015_timevae_grid/runs/run_00003_new_npz_data_weather_data_T84_weather_london_2006_2015_ld8_rw3.0_lr0.001_bs16/best_model",
+  "seed": 42,
+  "selected_feature_cols": [
+    "z500",
+    "t850",
+    "t2m",
+    "u10",
+    "v10"
+  ],
+  "source_run_dir": "/data/jinyuli/Projects/timeVAE/outputs/hpo/weather20062015/20260523_122951_london_2006_2015_timevae_grid/runs/run_00003_new_npz_data_weather_data_T84_weather_london_2006_2015_ld8_rw3.0_lr0.001_bs16",
+  "split_method": "full_train_recent_blocks",
+  "start_date": null,
+  "stride": 1,
+  "synthetic_csv": "data/raw_data/weather_data/weatherbench/other_generative_model/iaaftmv20062015/london_surrogate_0001.csv",
+  "synthetic_npz_file": null,
+  "synthetic_shape": [
+    14525,
+    84,
+    5
+  ],
+  "time_col": null,
+  "tsne": {
+    "generated_used": 2000,
+    "original_used": 2000,
+    "output_file": "outputs/external_eval/iaaft_london_2006_2015/tsne_london_surrogate_0001_vs_train.png",
+    "perplexity": 40
+  },
+  "valid_perc": 0.154424
+}
