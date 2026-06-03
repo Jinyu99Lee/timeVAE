@@ -231,12 +231,12 @@ Important HPO and training options:
 - `--valid-perc`: validation fraction for `--split-method tail_holdout`.
 - `--split-method`: validation split strategy. Choices are:
   - `tail_holdout` (default): reserve the final `valid_perc` fraction of samples for validation, then shuffle only the training split.
-  - `full_train_recent_blocks`: use all samples for training and copy validation from three recent fixed 122-day/488-sample blocks. This protocol requires at least 4384 samples and is intended for the weather recent-block experiments.
+  - `full_train_recent_blocks`: hold out validation from three recent fixed 122-day/488-sample blocks and use the remaining samples for training. This protocol requires at least 4384 samples and is intended for the weather recent-block experiments.
 - `--free-bits`: optional HPO grid values for the VAE free-bits floor, for example `--free-bits 0.1 0.01 0.001`. Omit it to use `src/config/hyperparameters.yaml`.
 - `--kl-anneal-epochs`: optional HPO grid values for the VAE KL annealing schedule, for example `--kl-anneal-epochs 50 200 500`. Omit it to use `src/config/hyperparameters.yaml`.
 - `--histogram-distance-backend`: backend for batch histogram-distance monitoring. Choices are `numpy` (default, closest to rerun behavior) and `tensorflow` (avoids per-batch NumPy callbacks and can reduce CPU/Python overhead).
 - `--disable-train-histogram-distance`: skip training-batch histogram monitoring while still computing validation histogram distance. Useful when HPO monitors `val_histogram_distance`.
-- `--monitor-metric`: metric used for best-weight restore, early stopping, optional learning-rate reduction, and HPO best-run selection. Choices are `val_total_loss` (default), `total_loss`, `val_histogram_distance`, and `histogram_distance`.
+- `--monitor-metric`: metric used for best-weight restore, early stopping, optional learning-rate reduction, and HPO best-run selection. Choices are `val_total_loss` (default), `total_loss`, `val_histogram_distance`, and `histogram_distance`. In `--loss-mode legacy`, selecting `val_total_loss` or `total_loss` logs and monitors total loss divided by the configured batch size so HPO comparisons are not dominated by batch-size scale.
 - `--early-stopping-min-delta`: minimum improvement required in the selected monitor metric before early stopping considers an epoch improved. Use this to control HPO min delta.
 - `--early-stopping-patience`: number of unimproved monitored epochs to tolerate before early stopping. Defaults to `50`.
 - `--early-stopping-start-epoch`: zero-based epoch before which early-stopping patience is not counted.
@@ -253,9 +253,9 @@ python src/hpo_grid_search.py ... \
 Each HPO run writes its own directory under `outputs/hpo/<timestamp>/runs/` with:
 
 - `config.json`: dataset, seed, split method, monitor metric, and hyperparameters for the run.
-- `history.csv`: epoch metrics including loss terms and histogram distance metrics.
+- `history.csv`: epoch metrics including loss terms, raw KL loss, and histogram distance metrics.
 - `timing.json`: start time, end time, and duration in seconds.
-- `loss_curve.png`: train/validation ELBO-style curves (`reconstruction_loss + kl_loss`), unweighted reconstruction loss, KL loss, and histogram distance.
+- `loss_curve.png`: train/validation ELBO-style curves (`reconstruction_loss + kl_loss`), unweighted reconstruction loss, free-bits KL loss, raw KL loss, and histogram distance.
 - `best_model/`: scaler and model weights restored from the best epoch for the selected monitor metric.
 
 The sweep root also contains `results.csv`, `results.jsonl`, `search_config.json`, and

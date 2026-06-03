@@ -55,9 +55,9 @@ def get_npz_data(input_file: str) -> np.ndarray:
     return loaded["data"]
 
 
-def _full_train_recent_blocks_valid_data(data: np.ndarray) -> np.ndarray:
+def _full_train_recent_blocks_valid_indices(num_samples: int) -> np.ndarray:
     """
-    Build a validation set by copying three recent-year sample blocks.
+    Build validation indices from three recent-year sample blocks.
 
     The slices are expressed on the sample axis and intentionally match the
     experiment protocol. Each block spans 122 days at 4 samples per day:
@@ -72,22 +72,23 @@ def _full_train_recent_blocks_valid_data(data: np.ndarray) -> np.ndarray:
         slice(-1460 - 976, -1460 - 488),
         slice(-2920 - 1464, -2920 - 976),
     )
-    if data.shape[0] < min_required_samples:
+    if num_samples < min_required_samples:
         raise ValueError(
             "split_method='full_train_recent_blocks' requires at least "
-            f"{min_required_samples} samples, got {data.shape[0]}."
+            f"{min_required_samples} samples, got {num_samples}."
         )
 
-    valid_parts = [data[valid_slice].copy() for valid_slice in valid_slices]
-    for idx, valid_part in enumerate(valid_parts):
-        if valid_part.shape[0] != expected_block_size:
+    sample_indices = np.arange(num_samples)
+    valid_indices = [sample_indices[valid_slice] for valid_slice in valid_slices]
+    for idx, block_indices in enumerate(valid_indices):
+        if block_indices.shape[0] != expected_block_size:
             raise ValueError(
                 "Recent-block validation split produced an unexpected block size "
                 f"for block {idx}: expected {expected_block_size}, got "
-                f"{valid_part.shape[0]}."
+                f"{block_indices.shape[0]}."
             )
 
-    return np.concatenate(valid_parts, axis=0)
+    return np.concatenate(valid_indices, axis=0)
 
 
 def _shuffle_samples(data: np.ndarray, seed: int) -> np.ndarray:
@@ -119,17 +120,23 @@ def split_data(
         split_method (str, optional): Split strategy. "tail_holdout" reserves
                                       the last valid_perc samples for validation,
                                       then shuffles only the training split.
-                                      "full_train_recent_blocks" uses all samples
-                                      for shuffled training and copies validation
-                                      from three recent-year blocks.
+                                      "full_train_recent_blocks" holds out
+                                      validation from three recent-year blocks
+                                      and uses the remaining samples for
+                                      shuffled training.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: A tuple containing the training data and
                                        validation data arrays.
     """
     if split_method == "full_train_recent_blocks":
-        train_data = _shuffle_samples(data, seed) if shuffle else data.copy()
-        valid_data = _full_train_recent_blocks_valid_data(data)
+        valid_indices = _full_train_recent_blocks_valid_indices(data.shape[0])
+        train_mask = np.ones(data.shape[0], dtype=bool)
+        train_mask[valid_indices] = False
+        train_data = data[train_mask].copy()
+        valid_data = data[valid_indices].copy()
+        if shuffle:
+            train_data = _shuffle_samples(train_data, seed)
         return train_data, valid_data
     if split_method != "tail_holdout":
         raise ValueError(

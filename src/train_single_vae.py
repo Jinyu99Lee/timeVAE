@@ -96,9 +96,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Data split strategy. tail_holdout reserves the final "
             "valid-percentage samples for validation, then shuffles only "
-            "training data; full_train_recent_blocks uses all samples for "
-            "training and copies validation from three recent "
-            "122-day/488-sample blocks."
+            "training data; full_train_recent_blocks holds out validation "
+            "from three recent 122-day/488-sample blocks and uses the "
+            "remaining samples for training."
         ),
     )
     parser.add_argument("--latent-dim", type=int, required=True)
@@ -280,6 +280,8 @@ def plot_loss_curve(path: Path, history: dict[str, list[Any]]) -> None:
     )
     plotted |= plot_series(ax, "kl_loss", "Train KL", "#95d5b2", "-")
     plotted |= plot_series(ax, "val_kl_loss", "Val KL", "#2d6a4f", "--")
+    plotted |= plot_series(ax, "raw_kl_loss", "Train raw KL", "#90be6d", ":")
+    plotted |= plot_series(ax, "val_raw_kl_loss", "Val raw KL", "#1b4332", ":")
     plotted |= plot_series(
         ax, "histogram_distance", "Train histogram", "#f4a3a3", "-"
     )

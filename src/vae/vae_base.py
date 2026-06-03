@@ -245,10 +245,12 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.loss_mode = loss_mode
         self.histogram_distance_backend = histogram_distance_backend
         self.compute_train_histogram_distance = compute_train_histogram_distance
+        self.normalize_legacy_total_loss_metrics = False
         self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = Mean(name="total_loss")
         self.reconstruction_loss_tracker = Mean(name="reconstruction_loss")
         self.kl_loss_tracker = Mean(name="kl_loss")
+        self.raw_kl_loss_tracker = Mean(name="raw_kl_loss")
         self.reconstruction_component_loss_tracker = Mean(
             name="reconstruction_component_loss"
         )
@@ -275,6 +277,10 @@ class BaseVariationalAutoencoder(Model, ABC):
             raise ValueError(
                 f"monitor_metric={monitor_metric!r} requires validation data."
             )
+        self.normalize_legacy_total_loss_metrics = (
+            self.loss_mode == "legacy"
+            and monitor_metric in ("total_loss", "val_total_loss")
+        )
         best_weights = RestoreBestWeights(
             monitor=monitor_metric,
             min_delta=early_stopping_min_delta,
@@ -310,6 +316,7 @@ class BaseVariationalAutoencoder(Model, ABC):
             self.total_loss_tracker,
             self.reconstruction_loss_tracker,
             self.kl_loss_tracker,
+            self.raw_kl_loss_tracker,
             self.reconstruction_component_loss_tracker,
             self.kl_component_loss_tracker,
             self.histogram_distance_tracker,
@@ -412,6 +419,12 @@ class BaseVariationalAutoencoder(Model, ABC):
         histogram_distance.set_shape(())
         return histogram_distance
 
+    def _logged_total_loss(self):
+        total_loss = self.total_loss_tracker.result()
+        if self.normalize_legacy_total_loss_metrics:
+            total_loss = total_loss / tf.cast(self.batch_size, total_loss.dtype)
+        return total_loss
+
     def train_step(self, X):
         with tf.GradientTape() as tape:
             z_mean, z_log_var, z = self.encoder(X)
@@ -421,6 +434,9 @@ class BaseVariationalAutoencoder(Model, ABC):
             reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
             kl_loss = self._get_kl_loss(z_mean, z_log_var)
+            raw_kl_loss = self._get_kl_loss(
+                z_mean, z_log_var, apply_free_bits=False
+            )
 
             if self.loss_mode == "legacy":
                 total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
@@ -446,6 +462,9 @@ class BaseVariationalAutoencoder(Model, ABC):
             reconstruction_loss, sample_weight=sample_weight
         )
         self.kl_loss_tracker.update_state(kl_loss, sample_weight=sample_weight)
+        self.raw_kl_loss_tracker.update_state(
+            raw_kl_loss, sample_weight=sample_weight
+        )
         self.reconstruction_component_loss_tracker.update_state(
             reconstruction_component_loss, sample_weight=sample_weight
         )
@@ -453,11 +472,13 @@ class BaseVariationalAutoencoder(Model, ABC):
             kl_component_loss, sample_weight=sample_weight
         )
 
+        logged_total_loss = self._logged_total_loss()
         logs = {
-            "loss": self.total_loss_tracker.result(),
-            "total_loss": self.total_loss_tracker.result(),
+            "loss": logged_total_loss,
+            "total_loss": logged_total_loss,
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
+            "raw_kl_loss": self.raw_kl_loss_tracker.result(),
             "reconstruction_component_loss": (
                 self.reconstruction_component_loss_tracker.result()
             ),
@@ -478,6 +499,7 @@ class BaseVariationalAutoencoder(Model, ABC):
         reconstruction_loss = self._get_reconstruction_loss(X, reconstruction)
 
         kl_loss = self._get_kl_loss(z_mean, z_log_var)
+        raw_kl_loss = self._get_kl_loss(z_mean, z_log_var, apply_free_bits=False)
 
         if self.loss_mode == "legacy":
             total_loss = self.reconstruction_wt * reconstruction_loss + kl_loss
@@ -498,6 +520,9 @@ class BaseVariationalAutoencoder(Model, ABC):
             reconstruction_loss, sample_weight=sample_weight
         )
         self.kl_loss_tracker.update_state(kl_loss, sample_weight=sample_weight)
+        self.raw_kl_loss_tracker.update_state(
+            raw_kl_loss, sample_weight=sample_weight
+        )
         self.reconstruction_component_loss_tracker.update_state(
             reconstruction_component_loss, sample_weight=sample_weight
         )
@@ -508,11 +533,13 @@ class BaseVariationalAutoencoder(Model, ABC):
             histogram_distance, sample_weight=sample_weight
         )
 
+        logged_total_loss = self._logged_total_loss()
         return {
-            "loss": self.total_loss_tracker.result(),
-            "total_loss": self.total_loss_tracker.result(),
+            "loss": logged_total_loss,
+            "total_loss": logged_total_loss,
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
             "kl_loss": self.kl_loss_tracker.result(),
+            "raw_kl_loss": self.raw_kl_loss_tracker.result(),
             "reconstruction_component_loss": (
                 self.reconstruction_component_loss_tracker.result()
             ),

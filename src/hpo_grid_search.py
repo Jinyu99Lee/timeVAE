@@ -73,8 +73,9 @@ def parse_args() -> argparse.Namespace:
             "Data split strategy passed to train_single_vae.py. "
             "tail_holdout reserves the final valid-percentage samples for "
             "validation, then shuffles only training data; "
-            "full_train_recent_blocks uses all samples for training and "
-            "copies validation from three recent 122-day/488-sample blocks."
+            "full_train_recent_blocks holds out validation from three "
+            "recent 122-day/488-sample blocks and uses the remaining "
+            "samples for training."
         ),
     )
     parser.add_argument("--latent-dim", type=int, nargs="+", required=True)
