@@ -351,6 +351,7 @@ def save_distribution_evaluation(
     num_bins: int | None,
     real_label: str,
     synthetic_label: str,
+    make_histograms: bool = True,
 ) -> dict[str, Any]:
     validate_series_pair(real_data, synthetic_data)
     resolved_num_bins = resolve_num_bins(real_data, num_bins)
@@ -363,20 +364,25 @@ def save_distribution_evaluation(
     statistics_file = output_dir / "feature_statistics.csv"
     histograms_file = output_dir / "feature_distribution_histograms.pdf"
     write_feature_statistics_csv(statistics_file, rows)
-    plot_feature_histograms_pdf(
-        real_data=real_data,
-        synthetic_data=synthetic_data,
-        feature_names=feature_names,
-        output_file=histograms_file,
-        num_bins=resolved_num_bins,
-        real_label=real_label,
-        synthetic_label=synthetic_label,
-    )
+    # The per-feature histogram PDF stacks one subplot row per feature, so for
+    # high-dimensional data (e.g. ILI with 818 features) it is both unreadable
+    # and exceeds matplotlib's 2^16-pixel figure limit. Allow callers to skip it
+    # while still writing the per-feature statistics CSV and averaged metrics.
+    if make_histograms:
+        plot_feature_histograms_pdf(
+            real_data=real_data,
+            synthetic_data=synthetic_data,
+            feature_names=feature_names,
+            output_file=histograms_file,
+            num_bins=resolved_num_bins,
+            real_label=real_label,
+            synthetic_label=synthetic_label,
+        )
     average_row = rows[-1]
     return {
         "num_bins": resolved_num_bins,
         "feature_statistics_file": str(statistics_file),
-        "feature_histograms_file": str(histograms_file),
+        "feature_histograms_file": str(histograms_file) if make_histograms else None,
         "average_abs_mean_diff": average_row["abs_mean_diff"],
         "average_abs_variance_diff": average_row["abs_variance_diff"],
         "average_histogram_distance": average_row["histogram_distance"],
