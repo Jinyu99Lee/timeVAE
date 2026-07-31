@@ -286,6 +286,8 @@ class TimeVAE(BaseVariationalAutoencoder):
             "loss_mode": self.loss_mode,
             "histogram_distance_backend": self.histogram_distance_backend,
             "compute_train_histogram_distance": self.compute_train_histogram_distance,
+            "compute_val_histogram_distance": self.compute_val_histogram_distance,
+            "monitor_kl_latent_ref": self.monitor_kl_latent_ref,
             "hidden_layer_sizes": list(
                 self.hidden_layer_sizes
             ),  # make sure it's a list which is serializable

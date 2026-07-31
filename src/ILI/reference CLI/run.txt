@@ -1,0 +1,22 @@
+nohup python src/hpo_grid_search.py \
+  --dataset new_npz_data/weather_data/T32/weather_london_2003_2014 \
+  --vae-type timeVAE \
+  --valid-perc 0.154424 \
+  --latent-dim 8 16 \
+  --reconstruction-wt 3 \
+  --learning-rate 0.0001 0.001 0.01 \
+  --batch-size 16 32 64 \
+  --max-epochs 1000 \
+  --loss-mode legacy \
+  --monitor-metric val_total_loss \
+  --histogram-distance-backend tensorflow \
+  --disable-train-histogram-distance \
+  --seed 42 \
+  --early-stopping-start-epoch 0 \
+  --early-stopping-patience 50 \
+  --gpu-slots 1:2 \
+  --early-stopping-min-delta 1e-4 \
+  --split-method full_train_recent_blocks \
+  --experiment-group weather20032014_oldloss_valloss \
+  --experiment-name london_2003_2014_timevae_grid_T32 \
+  > log/hpo_experiment/weather20032014_oldloss_valloss/hpo_weather_london_2003_2014_T32.log 2>&1 &

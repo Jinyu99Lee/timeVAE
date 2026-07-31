@@ -96,15 +96,22 @@ def main() -> None:
     seed = int(args.seed if args.seed is not None else config.get("seed", 42))
     set_seeds(seed)
 
-    dataset_file = Path(paths.DATASETS_DIR) / f"{dataset}.npz"
-    data, feature_names = load_npz_data_and_feature_names(dataset_file)
-    train_data, valid_data = split_data(
-        data,
-        valid_perc=valid_perc,
-        shuffle=True,
-        seed=seed,
-        split_method=split_method,
-    )
+    train_npz = config.get("train_npz")
+    if train_npz:
+        # ILI mode: read the pre-split train/val npz directly (no in-framework split).
+        train_data, feature_names = load_npz_data_and_feature_names(Path(train_npz))
+        valid_data, _ = load_npz_data_and_feature_names(Path(config["val_npz"]))
+        data = train_data  # T,D reference for the existing-generated-npz shape check
+    else:
+        dataset_file = Path(paths.DATASETS_DIR) / f"{dataset}.npz"
+        data, feature_names = load_npz_data_and_feature_names(dataset_file)
+        train_data, valid_data = split_data(
+            data,
+            valid_perc=valid_perc,
+            shuffle=True,
+            seed=seed,
+            split_method=split_method,
+        )
     compare_original = select_split(train_data, valid_data, args.compare_split)
 
     scaler = None
@@ -177,6 +184,8 @@ def main() -> None:
         "source_run_dir": str(run_dir),
         "model_dir": str(model_dir),
         "dataset": dataset,
+        "train_npz": config.get("train_npz"),
+        "val_npz": config.get("val_npz"),
         "vae_type": vae_type,
         "valid_perc": valid_perc,
         "split_method": split_method,

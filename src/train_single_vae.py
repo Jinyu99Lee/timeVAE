@@ -19,6 +19,7 @@ import numpy as np
 
 import paths
 from data_utils import (
+    get_npz_data,
     inverse_transform_data,
     load_data,
     load_yaml_file,
@@ -86,7 +87,24 @@ class WandbEpochLogger:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train one VAE experiment.")
-    parser.add_argument("--dataset", required=True, help="Dataset path relative to data/, without .npz.")
+    parser.add_argument(
+        "--dataset",
+        default=None,
+        help=(
+            "Single npz path relative to data/, without .npz (weather mode; "
+            "split in-framework). Optional when --train-npz is given."
+        ),
+    )
+    parser.add_argument(
+        "--train-npz",
+        default=None,
+        help="Pre-split train npz (ILI mode). Read directly, no in-framework split.",
+    )
+    parser.add_argument(
+        "--val-npz",
+        default=None,
+        help="Pre-split validation npz, used with --train-npz.",
+    )
     parser.add_argument("--vae-type", default="timeVAE", choices=("timeVAE", "vae_dense", "vae_conv"))
     parser.add_argument("--valid-perc", type=float, default=0.1)
     parser.add_argument(
@@ -132,7 +150,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip histogram_distance during training batches. Validation histogram "
-            "distance is still computed for val_histogram_distance."
+            "distance is controlled separately by --disable-val-histogram-distance."
+        ),
+    )
+    parser.add_argument(
+        "--disable-val-histogram-distance",
+        action="store_true",
+        help=(
+            "Skip histogram_distance during validation batches. This also avoids the "
+            "extra decoder forward pass over prior samples each validation epoch. "
+            "Ignored (forced on) when --monitor-metric is val_histogram_distance."
         ),
     )
     parser.add_argument(
@@ -175,6 +202,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Enable Keras ReduceLROnPlateau. Disabled by default. "
             "When enabled, it monitors --monitor-metric with factor=0.5 and patience=30."
+        ),
+    )
+    parser.add_argument(
+        "--monitor-kl-latent-ref",
+        type=int,
+        default=None,
+        help=(
+            "Legacy-loss only. When set (e.g. 8), the monitored total_loss scales "
+            "the KL component by ref/latent_dim so HPO selection and early stopping "
+            "compare latent dims fairly. Selection-only; the gradient is unchanged."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -338,8 +375,20 @@ def main() -> None:
     args = parse_args()
     if args.run_id is None:
         args.run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
-    if args.split_method == "tail_holdout" and not 0 < args.valid_perc < 1:
+    explicit_split = args.train_npz is not None
+    if explicit_split:
+        if args.val_npz is None:
+            raise ValueError("--train-npz requires --val-npz.")
+    elif args.dataset is None:
+        raise ValueError("Provide --dataset (single npz) or --train-npz + --val-npz.")
+    if (
+        not explicit_split
+        and args.split_method == "tail_holdout"
+        and not 0 < args.valid_perc < 1
+    ):
         raise ValueError("--valid-perc must be between 0 and 1 for tail_holdout splits.")
+    if args.monitor_kl_latent_ref is not None and args.monitor_kl_latent_ref <= 0:
+        raise ValueError("--monitor-kl-latent-ref must be a positive integer.")
     if args.early_stopping_start_epoch < 0:
         raise ValueError("--early-stopping-start-epoch must be non-negative.")
     if args.early_stopping_min_delta < 0:
@@ -356,6 +405,11 @@ def main() -> None:
         raise ValueError(
             "--disable-train-histogram-distance cannot be used with "
             "--monitor-metric histogram_distance. Use val_histogram_distance instead."
+        )
+    if args.disable_val_histogram_distance and monitor_metric == "val_histogram_distance":
+        raise ValueError(
+            "--disable-val-histogram-distance cannot be used with "
+            "--monitor-metric val_histogram_distance."
         )
 
     run_dir = args.run_dir
@@ -380,6 +434,10 @@ def main() -> None:
             "compute_train_histogram_distance": (
                 not args.disable_train_histogram_distance
             ),
+            "compute_val_histogram_distance": (
+                not args.disable_val_histogram_distance
+            ),
+            "monitor_kl_latent_ref": args.monitor_kl_latent_ref,
         }
     )
     if args.free_bits is not None:
@@ -387,10 +445,18 @@ def main() -> None:
     if args.kl_anneal_epochs is not None:
         hyperparameters["kl_anneal_epochs"] = args.kl_anneal_epochs
 
+    dataset_label = args.dataset
+    if explicit_split and dataset_label is None:
+        dataset_label = Path(args.train_npz).name[: -len("_train.npz")] if (
+            Path(args.train_npz).name.endswith("_train.npz")
+        ) else Path(args.train_npz).stem
+
     gpu_status = tensorflow_gpu_status()
     config = {
         "run_id": args.run_id,
-        "dataset": args.dataset,
+        "dataset": dataset_label,
+        "train_npz": args.train_npz,
+        "val_npz": args.val_npz,
         "vae_type": args.vae_type,
         "valid_perc": args.valid_perc,
         "split_method": args.split_method,
@@ -403,6 +469,9 @@ def main() -> None:
         "histogram_distance_backend": args.histogram_distance_backend,
         "compute_train_histogram_distance": (
             not args.disable_train_histogram_distance
+        ),
+        "compute_val_histogram_distance": (
+            not args.disable_val_histogram_distance
         ),
         "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
         "loss_mode": args.loss_mode,
@@ -424,14 +493,24 @@ def main() -> None:
                 "--require-gpu was set, but TensorFlow cannot see any GPU. "
                 f"gpu_status={gpu_status}"
             )
-        data = load_data(data_dir=paths.DATASETS_DIR, dataset=args.dataset)
-        train_data, valid_data = split_data(
-            data,
-            valid_perc=args.valid_perc,
-            shuffle=True,
-            seed=args.seed,
-            split_method=args.split_method,
-        )
+        if explicit_split:
+            # ILI mode: read the pre-split train/val npz directly (no in-framework split).
+            train_data = get_npz_data(args.train_npz)
+            valid_data = get_npz_data(args.val_npz)
+            if train_data.shape[1:] != valid_data.shape[1:]:
+                raise ValueError(
+                    "train/val npz T,D mismatch: "
+                    f"{train_data.shape} vs {valid_data.shape}"
+                )
+        else:
+            data = load_data(data_dir=paths.DATASETS_DIR, dataset=args.dataset)
+            train_data, valid_data = split_data(
+                data,
+                valid_perc=args.valid_perc,
+                shuffle=True,
+                seed=args.seed,
+                split_method=args.split_method,
+            )
         scaled_train_data, scaled_valid_data, scaler = scale_data(train_data, valid_data)
 
         _, sequence_length, feature_dim = scaled_train_data.shape
@@ -495,7 +574,10 @@ def main() -> None:
             "run_id": args.run_id,
             "status": status,
             "error": error,
-            "dataset": args.dataset,
+            "dataset": dataset_label,
+            "train_npz": args.train_npz,
+            "val_npz": args.val_npz,
+            "monitor_kl_latent_ref": args.monitor_kl_latent_ref,
             "vae_type": args.vae_type,
             "latent_dim": args.latent_dim,
             "reconstruction_wt": args.reconstruction_wt,
@@ -513,6 +595,9 @@ def main() -> None:
             "histogram_distance_backend": args.histogram_distance_backend,
             "compute_train_histogram_distance": (
                 not args.disable_train_histogram_distance
+            ),
+            "compute_val_histogram_distance": (
+                not args.disable_val_histogram_distance
             ),
             "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             "require_gpu": args.require_gpu,

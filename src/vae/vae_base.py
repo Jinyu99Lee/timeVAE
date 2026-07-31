@@ -225,6 +225,8 @@ class BaseVariationalAutoencoder(Model, ABC):
         loss_mode="current",
         histogram_distance_backend="numpy",
         compute_train_histogram_distance=True,
+        compute_val_histogram_distance=True,
+        monitor_kl_latent_ref=None,
         **kwargs,
     ):
         super(BaseVariationalAutoencoder, self).__init__(**kwargs)
@@ -245,6 +247,14 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.loss_mode = loss_mode
         self.histogram_distance_backend = histogram_distance_backend
         self.compute_train_histogram_distance = compute_train_histogram_distance
+        self.compute_val_histogram_distance = compute_val_histogram_distance
+        # When set (>0) and loss_mode == "legacy", the *monitored* total_loss
+        # scales the KL component by (ref / latent_dim) so HPO selection and
+        # early stopping compare latent dims fairly. Selection-only; the
+        # training gradient is untouched.
+        self.monitor_kl_latent_ref = (
+            float(monitor_kl_latent_ref) if monitor_kl_latent_ref else None
+        )
         self.normalize_legacy_total_loss_metrics = False
         self.kl_weight = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.total_loss_tracker = Mean(name="total_loss")
@@ -281,6 +291,9 @@ class BaseVariationalAutoencoder(Model, ABC):
             self.loss_mode == "legacy"
             and monitor_metric in ("total_loss", "val_total_loss")
         )
+        if monitor_metric == "val_histogram_distance":
+            # The monitored metric must be computed, regardless of the switch.
+            self.compute_val_histogram_distance = True
         best_weights = RestoreBestWeights(
             monitor=monitor_metric,
             min_delta=early_stopping_min_delta,
@@ -420,7 +433,15 @@ class BaseVariationalAutoencoder(Model, ABC):
         return histogram_distance
 
     def _logged_total_loss(self):
-        total_loss = self.total_loss_tracker.result()
+        if self.monitor_kl_latent_ref and self.loss_mode == "legacy":
+            # Rebuild the total from components so the KL part can be scaled by
+            # ref/latent_dim (legacy: recon_component = wt*recon, kl_component = kl).
+            recon_component = self.reconstruction_component_loss_tracker.result()
+            kl_component = self.kl_component_loss_tracker.result()
+            kl_scale = self.monitor_kl_latent_ref / float(self.latent_dim)
+            total_loss = recon_component + kl_scale * kl_component
+        else:
+            total_loss = self.total_loss_tracker.result()
         if self.normalize_legacy_total_loss_metrics:
             total_loss = total_loss / tf.cast(self.batch_size, total_loss.dtype)
         return total_loss
@@ -512,9 +533,6 @@ class BaseVariationalAutoencoder(Model, ABC):
 
         batch_size = tf.shape(X)[0]
         sample_weight = tf.cast(batch_size, tf.float32)
-        prior_z = tf.random.normal(shape=(batch_size, self.latent_dim), dtype=tf.float32)
-        prior_samples = self._as_tensor(self.decoder(prior_z))
-        histogram_distance = self._get_histogram_distance(X, prior_samples)
         self.total_loss_tracker.update_state(total_loss, sample_weight=sample_weight)
         self.reconstruction_loss_tracker.update_state(
             reconstruction_loss, sample_weight=sample_weight
@@ -529,12 +547,9 @@ class BaseVariationalAutoencoder(Model, ABC):
         self.kl_component_loss_tracker.update_state(
             kl_component_loss, sample_weight=sample_weight
         )
-        self.histogram_distance_tracker.update_state(
-            histogram_distance, sample_weight=sample_weight
-        )
 
         logged_total_loss = self._logged_total_loss()
-        return {
+        logs = {
             "loss": logged_total_loss,
             "total_loss": logged_total_loss,
             "reconstruction_loss": self.reconstruction_loss_tracker.result(),
@@ -544,8 +559,18 @@ class BaseVariationalAutoencoder(Model, ABC):
                 self.reconstruction_component_loss_tracker.result()
             ),
             "kl_component_loss": self.kl_component_loss_tracker.result(),
-            "histogram_distance": self.histogram_distance_tracker.result(),
         }
+        if self.compute_val_histogram_distance:
+            prior_z = tf.random.normal(
+                shape=(batch_size, self.latent_dim), dtype=tf.float32
+            )
+            prior_samples = self._as_tensor(self.decoder(prior_z))
+            histogram_distance = self._get_histogram_distance(X, prior_samples)
+            self.histogram_distance_tracker.update_state(
+                histogram_distance, sample_weight=sample_weight
+            )
+            logs["histogram_distance"] = self.histogram_distance_tracker.result()
+        return logs
 
     def save_weights(self, model_dir):
         if self.model_name is None:
@@ -584,6 +609,8 @@ class BaseVariationalAutoencoder(Model, ABC):
             "loss_mode": self.loss_mode,
             "histogram_distance_backend": self.histogram_distance_backend,
             "compute_train_histogram_distance": self.compute_train_histogram_distance,
+            "compute_val_histogram_distance": self.compute_val_histogram_distance,
+            "monitor_kl_latent_ref": self.monitor_kl_latent_ref,
             "hidden_layer_sizes": list(self.hidden_layer_sizes),
         }
         params_file = os.path.join(model_dir, f"{self.model_name}_parameters.pkl")

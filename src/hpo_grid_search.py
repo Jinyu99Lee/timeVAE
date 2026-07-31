@@ -33,6 +33,9 @@ RESULT_FIELDS = [
     "status",
     "error",
     "dataset",
+    "train_npz",
+    "val_npz",
+    "monitor_kl_latent_ref",
     "vae_type",
     "latent_dim",
     "reconstruction_wt",
@@ -49,6 +52,7 @@ RESULT_FIELDS = [
     "monitor_metric",
     "histogram_distance_backend",
     "compute_train_histogram_distance",
+    "compute_val_histogram_distance",
     "reduce_lr_on_plateau",
     "best_val_total_loss",
     "best_monitor_value",
@@ -63,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local grid search for TimeVAE.")
     parser.add_argument("--dataset", action="append", default=[], help="Dataset path relative to data/, without .npz. May be repeated.")
     parser.add_argument("--dataset-glob", default=None, help="Glob for npz files, e.g. data/new_npz_data/weather_data/T84/*.npz.")
+    parser.add_argument("--train-npz", default=None, help="ILI mode: pre-split train npz (read directly, no in-framework split). Use with --val-npz.")
+    parser.add_argument("--val-npz", default=None, help="ILI mode: pre-split validation npz.")
     parser.add_argument("--vae-type", default="timeVAE", choices=("timeVAE", "vae_dense", "vae_conv"))
     parser.add_argument("--valid-perc", type=float, default=0.1)
     parser.add_argument(
@@ -111,7 +117,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip histogram_distance during training batches in child runs. "
-            "Validation histogram distance is still computed."
+            "Validation histogram distance is controlled separately by "
+            "--disable-val-histogram-distance."
+        ),
+    )
+    parser.add_argument(
+        "--disable-val-histogram-distance",
+        action="store_true",
+        help=(
+            "Skip histogram_distance during validation batches in child runs, "
+            "avoiding the extra per-validation-epoch decoder forward pass. "
+            "Ignored (forced on) when --monitor-metric is val_histogram_distance."
         ),
     )
     parser.add_argument(
@@ -155,9 +171,31 @@ def parse_args() -> argparse.Namespace:
             "When enabled, it monitors --monitor-metric with factor=0.5 and patience=30."
         ),
     )
+    parser.add_argument(
+        "--monitor-kl-latent-ref",
+        type=int,
+        default=None,
+        help=(
+            "Legacy-loss only. When set (e.g. 8), child runs scale the KL component "
+            "of the monitored total_loss by ref/latent_dim so latent dims compare "
+            "fairly during HPO selection / early stopping. Selection-only."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu-slots", required=True, help="GPU concurrency map, e.g. 0:2,1:2,2:4. Use none:1 for CPU.")
     parser.add_argument("--output-dir", type=Path, default=None, help="Exact output directory. Overrides output root, group, and experiment name.")
+    parser.add_argument(
+        "--skip-completed",
+        action="store_true",
+        help=(
+            "Resume mode. Reuse the existing --output-dir: skip runs whose "
+            "runs/<run_id>/result.json already shows status=completed with a "
+            "non-null best_monitor_value, re-run only the rest, then rebuild "
+            "results.jsonl/results.csv/best_run.json from the final on-disk "
+            "state (one row per run_id). Requires the regenerated grid to match "
+            "the target dir's search_config.json so run_id indices stay aligned."
+        ),
+    )
     parser.add_argument("--output-root", type=Path, default=None, help="Root directory for HPO outputs. Defaults to outputs/hpo.")
     parser.add_argument("--experiment-group", default=None, help="Optional folder under the HPO output root, e.g. weather20032015.")
     parser.add_argument("--experiment-name", default=None, help="Human-readable experiment name appended after the timestamp.")
@@ -265,6 +303,94 @@ def write_results_csv(path: Path, results: list[dict[str, Any]]) -> None:
             writer.writerow({field: result.get(field) for field in RESULT_FIELDS})
 
 
+def write_results_jsonl(path: Path, results: list[dict[str, Any]]) -> None:
+    """Full rewrite of results.jsonl (counterpart to write_results_csv)."""
+    with path.open("w") as file:
+        for result in results:
+            file.write(json.dumps(result, sort_keys=True) + "\n")
+
+
+def run_is_completed(run_dir: Path) -> bool:
+    """A run counts as completed when its result.json reports a finished run
+    with a usable monitor value (matches how main() selects best_run.json)."""
+    result_path = run_dir / "result.json"
+    if not result_path.exists():
+        return False
+    try:
+        result = json.loads(result_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        result.get("status") == "completed"
+        and result.get("best_monitor_value") is not None
+    )
+
+
+def load_run_result(job: dict[str, Any]) -> dict[str, Any]:
+    """Read a planned job's current result.json for resume/rebuild, preserving
+    its stored gpu_id. Falls back to read_result's synthesized failed row when
+    result.json is missing so every planned job yields exactly one row."""
+    result_path = job["run_dir"] / "result.json"
+    gpu_id = ""
+    if result_path.exists():
+        try:
+            gpu_id = json.loads(result_path.read_text()).get("gpu_id") or ""
+        except (OSError, json.JSONDecodeError):
+            gpu_id = ""
+    return read_result(job, gpu_id, -1)
+
+
+def _grid_axis_equal(old: Any, new: Any) -> bool:
+    if old is None or new is None:
+        return old == new
+    if len(old) != len(new):
+        return False
+    for a, b in zip(old, new):
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            if abs(float(a) - float(b)) > 1e-9:
+                return False
+        elif a != b:
+            return False
+    return True
+
+
+def assert_grid_matches_existing(output_dir: Path, args: argparse.Namespace) -> None:
+    """In --skip-completed mode, refuse to reuse a dir whose recorded grid
+    differs from the one being generated: run_id indices come from the
+    itertools.product order in build_jobs, so a different grid would map the
+    same run_id to different hyperparameters and corrupt the resume."""
+    config_path = output_dir / "search_config.json"
+    if not config_path.exists():
+        return
+    try:
+        existing = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    axes = {
+        "latent_dim": args.latent_dim,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "reconstruction_wt": args.reconstruction_wt,
+        "free_bits": args.free_bits,
+        "kl_anneal_epochs": args.kl_anneal_epochs,
+    }
+    mismatches = [
+        (key, existing.get(key), new)
+        for key, new in axes.items()
+        if not _grid_axis_equal(existing.get(key), new)
+    ]
+    if mismatches:
+        detail = "\n".join(
+            f"  {key}: existing={old!r} new={new!r}" for key, old, new in mismatches
+        )
+        raise SystemExit(
+            "--skip-completed: the regenerated grid does not match the existing "
+            f"search_config.json in\n  {output_dir}\n"
+            "run_id indices come from the grid order, so reusing this dir with a "
+            "different grid would misalign runs. Make the grid match:\n" + detail
+        )
+
+
 def pip_nvidia_library_dirs() -> list[str]:
     dirs = []
     for site_dir in site.getsitepackages():
@@ -341,6 +467,9 @@ def build_jobs(args: argparse.Namespace, datasets: list[str], output_dir: Path) 
                 "compute_train_histogram_distance": (
                     not args.disable_train_histogram_distance
                 ),
+                "compute_val_histogram_distance": (
+                    not args.disable_val_histogram_distance
+                ),
                 "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             }
         )
@@ -360,14 +489,19 @@ def launch_job(
     cmd = [
         sys.executable,
         str(Path(__file__).with_name("train_single_vae.py")),
-        "--dataset",
-        job["dataset"],
+    ]
+    if args.train_npz is not None:
+        # ILI mode: read the pre-split train/val npz directly.
+        cmd += ["--train-npz", args.train_npz, "--val-npz", args.val_npz]
+    else:
+        cmd += [
+            "--dataset", job["dataset"],
+            "--valid-perc", str(args.valid_perc),
+            "--split-method", args.split_method,
+        ]
+    cmd += [
         "--vae-type",
         args.vae_type,
-        "--valid-perc",
-        str(args.valid_perc),
-        "--split-method",
-        args.split_method,
         "--latent-dim",
         str(job["latent_dim"]),
         "--reconstruction-wt",
@@ -409,8 +543,12 @@ def launch_job(
         cmd.extend(["--kl-anneal-epochs", str(job["kl_anneal_epochs"])])
     if args.disable_train_histogram_distance:
         cmd.append("--disable-train-histogram-distance")
+    if args.disable_val_histogram_distance:
+        cmd.append("--disable-val-histogram-distance")
     if args.enable_reduce_lr_on_plateau:
         cmd.append("--enable-reduce-lr-on-plateau")
+    if args.monitor_kl_latent_ref is not None:
+        cmd.extend(["--monitor-kl-latent-ref", str(args.monitor_kl_latent_ref)])
     if args.wandb_entity:
         cmd.extend(["--wandb-entity", args.wandb_entity])
     if args.generate_after_train:
@@ -454,6 +592,9 @@ def read_result(job: dict[str, Any], gpu_id: str, return_code: int) -> dict[str,
             "compute_train_histogram_distance": job[
                 "compute_train_histogram_distance"
             ],
+            "compute_val_histogram_distance": job[
+                "compute_val_histogram_distance"
+            ],
             "reduce_lr_on_plateau": job["reduce_lr_on_plateau"],
             "best_monitor_value": None,
             "run_dir": str(job["run_dir"]),
@@ -467,6 +608,10 @@ def read_result(job: dict[str, Any], gpu_id: str, return_code: int) -> dict[str,
     result.setdefault(
         "compute_train_histogram_distance",
         job["compute_train_histogram_distance"],
+    )
+    result.setdefault(
+        "compute_val_histogram_distance",
+        job["compute_val_histogram_distance"],
     )
     result.setdefault("reduce_lr_on_plateau", job["reduce_lr_on_plateau"])
     if (
@@ -498,16 +643,35 @@ def main() -> None:
             "--disable-train-histogram-distance cannot be used with "
             "--monitor-metric histogram_distance. Use val_histogram_distance instead."
         )
-    datasets = collect_datasets(args)
+    if args.disable_val_histogram_distance and args.monitor_metric == "val_histogram_distance":
+        raise ValueError(
+            "--disable-val-histogram-distance cannot be used with "
+            "--monitor-metric val_histogram_distance."
+        )
+    if args.train_npz is not None:
+        if args.val_npz is None:
+            raise ValueError("--train-npz requires --val-npz.")
+        if args.dataset or args.dataset_glob:
+            raise ValueError("--train-npz is mutually exclusive with --dataset/--dataset-glob.")
+        stem = Path(args.train_npz).name
+        label = stem[: -len("_train.npz")] if stem.endswith("_train.npz") else Path(stem).stem
+        datasets = [label]
+    else:
+        datasets = collect_datasets(args)
     gpu_slots = parse_gpu_slots(args.gpu_slots)
     output_dir = resolve_output_dir(args, datasets)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     jobs = build_jobs(args, datasets, output_dir)
+    if args.skip_completed:
+        assert_grid_matches_existing(output_dir, args)
     write_json(
         output_dir / "search_config.json",
         {
             "datasets": datasets,
+            "train_npz": args.train_npz,
+            "val_npz": args.val_npz,
+            "monitor_kl_latent_ref": args.monitor_kl_latent_ref,
             "vae_type": args.vae_type,
             "valid_perc": args.valid_perc,
             "split_method": args.split_method,
@@ -532,6 +696,9 @@ def main() -> None:
             "compute_train_histogram_distance": (
                 not args.disable_train_histogram_distance
             ),
+            "compute_val_histogram_distance": (
+                not args.disable_val_histogram_distance
+            ),
             "reduce_lr_on_plateau": args.enable_reduce_lr_on_plateau,
             "seed": args.seed,
             "gpu_slots": args.gpu_slots,
@@ -540,11 +707,25 @@ def main() -> None:
     )
 
     nvidia_library_dirs = pip_nvidia_library_dirs()
-    pending = list(jobs)
     running: list[dict[str, Any]] = []
     available_slots = list(enumerate(gpu_slots))
     results: list[dict[str, Any]] = []
     results_jsonl = output_dir / "results.jsonl"
+
+    if args.skip_completed:
+        # Resume: skip already-completed runs, seed results with their loaded
+        # rows (so the live results.csv stays complete), and only run the rest.
+        pending = [job for job in jobs if not run_is_completed(job["run_dir"])]
+        skipped = [job for job in jobs if run_is_completed(job["run_dir"])]
+        results = [load_run_result(job) for job in skipped]
+        write_results_csv(output_dir / "results.csv", results)
+        print(
+            "Resume mode: skipping {} completed run(s); {} remain.".format(
+                len(skipped), len(pending)
+            )
+        )
+    else:
+        pending = list(jobs)
 
     print(f"Prepared {len(jobs)} jobs in {output_dir}")
     while pending or running:
@@ -569,7 +750,10 @@ def main() -> None:
             available_slots.sort(key=lambda pair: pair[0])
             result = read_result(item["job"], item["gpu_id"], return_code)
             results.append(result)
-            append_jsonl(results_jsonl, result)
+            # In resume mode the existing results.jsonl may hold stale rows, so
+            # we don't append live; it is fully rebuilt from disk after the loop.
+            if not args.skip_completed:
+                append_jsonl(results_jsonl, result)
             write_results_csv(output_dir / "results.csv", results)
             print(
                 "Finished {} status={} {}={}".format(
@@ -580,6 +764,14 @@ def main() -> None:
                 )
             )
         running = still_running
+
+    if args.skip_completed:
+        # Clean rebuild: one authoritative row per planned run_id from the final
+        # on-disk state (completed skips + new successes + new failures). This
+        # drops stale rows and guarantees no duplicate run_ids in the summaries.
+        results = [load_run_result(job) for job in jobs]
+        write_results_jsonl(results_jsonl, results)
+        write_results_csv(output_dir / "results.csv", results)
 
     completed = [
         r

@@ -1,0 +1,6 @@
+python src/rerun_best_hpo.py \
+  --best-run outputs/hpo/weather20032014_oldloss_valloss/20260612_115704_london_2003_2014_timevae_grid_T32/best_run.json \
+  --num-samples train \
+  --compare-split train \
+  --output-dir outputs/rerunbest/weather20032014_oldloss_valloss/london_2003_2014_T32 \
+  --max-tsne-samples 20000

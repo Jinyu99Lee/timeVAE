@@ -1,0 +1,19 @@
+nohup: ignoring input
+Running 8 run scripts from /data/jinyuli/Projects/timeVAE/src/ILI/run_scripts/index.txt (MAXJOBS=1)
+[2026-06-22 12:07:13] START  run_ili_eng_2015_2016_T84_p28_tau01.sh
+[2026-06-22 12:10:49] DONE   run_ili_eng_2015_2016_T84_p28_tau01.sh
+[2026-06-22 12:10:49] START  run_ili_eng_2016_2017_T42_p14_tau01.sh
+[2026-06-23 00:57:22] DONE   run_ili_eng_2016_2017_T42_p14_tau01.sh
+[2026-06-23 00:57:22] START  run_ili_eng_2018_2019_T35_p7_tau01.sh
+[2026-06-23 07:51:46] DONE   run_ili_eng_2018_2019_T35_p7_tau01.sh
+[2026-06-23 07:51:46] START  run_ili_eng_2018_2019_T84_p28_tau01.sh
+[2026-06-23 07:55:22] DONE   run_ili_eng_2018_2019_T84_p28_tau01.sh
+[2026-06-23 07:55:22] START  run_ili_eng_2016_2017_T42_p14_tau005.sh
+[2026-06-23 07:58:58] DONE   run_ili_eng_2016_2017_T42_p14_tau005.sh
+[2026-06-23 07:58:58] START  run_ili_eng_2016_2017_T77_p21_tau005.sh
+[2026-06-23 08:02:34] DONE   run_ili_eng_2016_2017_T77_p21_tau005.sh
+[2026-06-23 08:02:34] START  run_ili_eng_2018_2019_T35_p7_tau005.sh
+[2026-06-23 08:06:10] DONE   run_ili_eng_2018_2019_T35_p7_tau005.sh
+[2026-06-23 08:06:10] START  run_ili_eng_2018_2019_T84_p28_tau005.sh
+[2026-06-23 08:09:46] DONE   run_ili_eng_2018_2019_T84_p28_tau005.sh
+All run scripts finished (failures=0).
