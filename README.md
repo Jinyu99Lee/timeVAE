@@ -314,6 +314,33 @@ Prior sampling draws latent vectors from `N(0, I)` and decodes them; it does not
 input samples except to choose default sizes, load the scaler, build the t-SNE
 comparison set, and choose the requested real split for distribution metrics.
 
+### Export completed ILI reruns for Sonnet
+
+After the ILI batch reruns finish, export a method-agnostic source manifest. The
+exporter follows each current `best_run.json`, validates its `rerun_config.json`,
+generated `(N,T,D)` array, original train/validation paths, feature columns, and
+finite values. It records paths only; existing generated NPZ files are not copied
+or modified.
+
+```bash
+cd src/ILI
+ILI_DATASET=ili_delta_new \
+  /data0/jinyuli/anaconda3/envs/timevae/bin/python export_sonnet_manifest.py \
+  --strict \
+  --output ../../outputs/manifests/ili_delta_new_timevae.csv
+```
+
+Sonnet then selects one row per `(h, year)` using its raw-validation tau CSV:
+
+```bash
+python3 scripts/run_ILI/run_ili_synthetic_hpo.py \
+  --model sonnet --h h7 \
+  --synth-method timevae \
+  --synth-manifest ../timeVAE/outputs/manifests/ili_delta_new_timevae.csv \
+  --tau-csv outputs/ili_hpo/raw_delta_new/eng/tauselection/tau_selection_sonnet.csv \
+  ...
+```
+
 To evaluate synthetic data from another method stored as a CSV, use the same best-run
 configuration without loading VAE weights:
 
