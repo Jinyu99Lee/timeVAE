@@ -367,6 +367,81 @@ python src/rerun_best_hpo.py \
 The external CSV is windowed with the original dataset sequence length, defaults to
 `--stride 1`, and uses the original NPZ `feature_cols` order when available.
 
+## ETTh1, Energy, and ELEC forecasting workflow
+
+`experiments/forecasting_timevae.json` is the authority for 14 generator jobs:
+four ETTh1 horizons, four Energy horizons, and three ELEC horizons for each of
+the independent 2020 and 2021 folds. The workflow has four explicit stages.
+None of the `--dry-run` commands below starts formal HPO.
+
+### 1. Build and validate source windows
+
+TimeVAE consumes the same physical-scale, pre-split NPZ contract as
+Diffusion-TS. Generate fresh sources after changing a converter; stale files
+without the current provenance fields are intentionally rejected.
+
+```bash
+cd ../Diffusion-TS
+python Data/etth1_to_npz.py --overwrite
+python Data/energy_to_npz.py --overwrite
+python Data/elec_to_npz.py --test-years 2020 2021 --dry-run
+python Data/elec_to_npz.py --test-years 2020 2021 --overwrite
+
+cd ../timeVAE
+python src/forecasting_experiments.py validate
+```
+
+Each source has stride 1, a validation holdout on sample indices
+`[floor(0.70*N), floor(0.85*N))`, target-last named channels, and hourly source
+frequency. `source_train_sha256` is SHA-256 over the contiguous canonical
+hourly training block converted to C-contiguous `float32` bytes. Validation
+checks integer sample/window-start indices, ranges, all reconstructed windows,
+timestamps, target index, dtype, and that hash.
+
+### 2. Run the fixed four-point TimeVAE HPO
+
+```bash
+python src/forecasting_experiments.py hpo \
+  --gpu-slots 0:1 \
+  --dry-run
+```
+
+Inspect `outputs/forecasting_hpo_commands.jsonl`, then remove `--dry-run` to
+launch. Every one of the 14 datasets has four candidates with learning rates
+`1e-4, 5e-4, 1e-3, 1e-2`; all other generator settings are fixed: TimeVAE,
+latent dimension 8, reconstruction weight 3, batch size 16, legacy loss,
+`val_total_loss`, 800 epochs, patience 20, and seed 42. This is 56 generator
+runs in total.
+
+### 3. Rerun each winner as a full-N physical-scale NPZ
+
+```bash
+python src/forecasting_experiments.py rerun --dry-run
+```
+
+After inspecting `outputs/forecasting_rerun_commands.jsonl`, remove
+`--dry-run`. Reruns require `--num-samples all --compare-split all`, inverse
+transform generated values back to the original physical scale, cast to
+`float32`, and emit exactly one generated sample slot for every source window.
+The NPZ and `rerun_config.json` carry the complete fixed protocol plus source,
+best-run, config, checkpoint, data-hash, index, geometry, and channel
+provenance. A rerun from a mismatched/stale HPO directory is rejected.
+
+### 4. Validate and export downstream Sonnet HPO commands
+
+```bash
+python src/forecasting_experiments.py export-sonnet \
+  --sonnet-root ../Sonnet \
+  --gpu-slots 0:1
+```
+
+This validates all generated files and writes a CSV manifest plus
+`outputs/manifests/forecasting_timevae_sonnet.sh`; it does not launch Sonnet.
+The downstream grid matches the raw-data profile: ETTh1 sweeps batch sizes
+16/32/64 (216 candidates per horizon), while Energy and both ELEC folds use
+batch size 64 (72 candidates per horizon). Across all 14 jobs this is 1,584
+Sonnet candidates. ELEC keeps `Value_NE5` as channel 9 and the final target.
+
 ## Plot Generated vs Original NPZ Samples
 
 Use `src/plot_npz_samples.py` to create random synthetic/original sample comparison PDFs.

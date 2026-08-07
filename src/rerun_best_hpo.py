@@ -19,6 +19,15 @@ from evaluation_utils import (
     select_split,
     write_json,
 )
+from forecasting_experiments import (
+    build_generated_metadata,
+    load_manifest,
+    save_generated_npz,
+    select_experiments,
+    validate_forecasting_hpo_config,
+    validate_generated_npz,
+    validate_source_pair,
+)
 from vae.vae_utils import get_prior_samples, load_vae_model, set_seeds
 
 
@@ -56,6 +65,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Override the seed stored in the HPO run config.")
     parser.add_argument("--save-scaled", action="store_true", help="Also save generated samples before inverse scaling.")
     parser.add_argument("--no-tsne", action="store_true", help="Skip t-SNE plot generation.")
+    parser.add_argument(
+        "--forecast-manifest",
+        type=Path,
+        default=None,
+        help="Strict forecasting manifest used to validate and annotate a full-N rerun.",
+    )
+    parser.add_argument(
+        "--forecast-experiment",
+        default=None,
+        help="Experiment id from --forecast-manifest. Requires --num-samples all.",
+    )
     return parser.parse_args()
 
 
@@ -86,7 +106,42 @@ def main() -> None:
     run_dir = resolve_run_dir(best_run, best_run_path)
     config = read_json(run_dir / "config.json")
     model_dir = run_dir / "best_model"
-    output_dir = args.output_dir if args.output_dir is not None else run_dir / "best_outputs"
+    if (args.forecast_manifest is None) != (args.forecast_experiment is None):
+        raise ValueError(
+            "--forecast-manifest and --forecast-experiment must be provided together."
+        )
+    forecast_experiment = None
+    forecast_contract = None
+    generator_protocol = None
+    if args.forecast_manifest is not None:
+        selected = select_experiments(
+            load_manifest(args.forecast_manifest), [args.forecast_experiment]
+        )
+        forecast_experiment = selected[0]
+        forecast_contract = validate_source_pair(forecast_experiment)
+        generator_protocol = validate_forecasting_hpo_config(
+            config, best_run, forecast_experiment, run_dir
+        )
+        if args.num_samples != "all":
+            raise ValueError("Forecasting reruns require --num-samples all.")
+        if args.compare_split != "all":
+            raise ValueError("Forecasting reruns require --compare-split all.")
+        if args.seed is not None and args.seed != generator_protocol["seed"]:
+            raise ValueError("Forecasting reruns cannot override the fixed generator seed.")
+        if args.save_scaled:
+            raise ValueError("Forecasting reruns only export inverse-scaled physical data.")
+
+    default_output_dir = (
+        forecast_experiment.rerun_output_dir
+        if forecast_experiment is not None
+        else run_dir / "best_outputs"
+    )
+    output_dir = args.output_dir if args.output_dir is not None else default_output_dir
+    if (
+        forecast_experiment is not None
+        and output_dir.resolve() != forecast_experiment.rerun_output_dir
+    ):
+        raise ValueError("Forecasting --output-dir must match the manifest rerun_output_dir.")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     dataset = config["dataset"]
@@ -97,7 +152,12 @@ def main() -> None:
     set_seeds(seed)
 
     train_npz = config.get("train_npz")
-    if train_npz:
+    if forecast_contract is not None:
+        train_data = forecast_contract["train_data"]
+        valid_data = forecast_contract["val_data"]
+        feature_names = forecast_contract["feature_cols"]
+        data = train_data
+    elif train_npz:
         # ILI mode: read the pre-split train/val npz directly (no in-framework split).
         train_data, feature_names = load_npz_data_and_feature_names(Path(train_npz))
         valid_data, _ = load_npz_data_and_feature_names(Path(config["val_npz"]))
@@ -115,9 +175,14 @@ def main() -> None:
     compare_original = select_split(train_data, valid_data, args.compare_split)
 
     scaler = None
-    generated_file = output_dir / f"{vae_type}_{Path(dataset).name}_best_prior_samples.npz"
+    generated_file = (
+        forecast_experiment.generated_npz
+        if forecast_experiment is not None
+        else output_dir / f"{vae_type}_{Path(dataset).name}_best_prior_samples.npz"
+    )
     scaled_file = None
     generation_mode = "sampled_prior"
+    generated_metadata = None
     if args.existing_generated_npz is not None:
         generation_mode = "existing_generated_npz"
         generated_file = args.existing_generated_npz.resolve()
@@ -138,13 +203,41 @@ def main() -> None:
                 "--save-scaled cannot be used with --existing-generated-npz "
                 "because the script is not generating new samples."
             )
+        if forecast_experiment is not None:
+            generated_metadata = validate_generated_npz(
+                forecast_experiment, generated_file
+            )
     else:
         scaler = load_scaler(str(model_dir))
         vae_model = load_vae_model(vae_type, str(model_dir))
         num_samples = resolve_num_samples(args.num_samples, train_data, valid_data)
         generated_scaled = get_prior_samples(vae_model, num_samples=num_samples)
         generated = inverse_transform_data(generated_scaled, scaler)
-        save_data(generated, str(generated_file))
+        generated = np.asarray(generated, dtype=np.float32)
+        if forecast_experiment is not None:
+            if generated.shape != (
+                forecast_experiment.expected_num_windows,
+                forecast_experiment.seq_len,
+                len(forecast_contract["feature_cols"]),
+            ):
+                raise ValueError(
+                    "Forecasting generation shape/count mismatch: "
+                    f"got {generated.shape}."
+                )
+            generated_metadata = build_generated_metadata(
+                experiment=forecast_experiment,
+                source_contract=forecast_contract,
+                best_run=best_run,
+                best_run_path=best_run_path,
+                run_dir=run_dir,
+                model_dir=model_dir,
+                seed=seed,
+                generated=generated,
+                generator_protocol=generator_protocol,
+            )
+            save_generated_npz(generated_file, generated, generated_metadata)
+        else:
+            save_data(generated, str(generated_file))
         if args.save_scaled:
             scaled_file = output_dir / f"{vae_type}_{Path(dataset).name}_best_prior_samples_scaled.npz"
             save_data(generated_scaled, str(scaled_file))
@@ -223,6 +316,15 @@ def main() -> None:
         "scaled_generated_file": str(scaled_file) if scaled_file is not None else None,
         "evaluation": evaluation_info,
         "tsne": tsne_info,
+        "forecast_experiment": (
+            forecast_experiment.experiment_id
+            if forecast_experiment is not None
+            else None
+        ),
+        "forecast_metadata": (
+            generated_metadata if forecast_experiment is not None else None
+        ),
+        "generator_protocol": generator_protocol,
     }
     write_json(output_dir / "rerun_config.json", summary)
     json_print(summary)

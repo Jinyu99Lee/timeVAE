@@ -1,0 +1,8 @@
+  --latent-dim 8 \
+  --learning-rate 0.0001 0.0005 0.001 0.01 \
+  --batch-size 16 \
+  --max-epochs 800 \
+  --monitor-kl-latent-ref 8 \
+  --early-stopping-start-epoch 0 \
+  --early-stopping-patience 20 \
+  --early-stopping-min-delta 1e-4
